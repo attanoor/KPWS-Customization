@@ -1,0 +1,493 @@
+import re
+import frappe
+from frappe import _
+from frappe.utils import cint
+
+ALLOWED_CUSTOMER_GROUPS = ("Cash", "Welfare", "Panel")
+
+PATIENT_GROUP_FIELDS = (
+    "customer_group",
+    "custom_customer_group",
+    "billing_type",
+    "custom_billing_type",
+)
+
+PATIENT_PANEL_FIELDS = (
+    "panel_name",
+    "custom_panel_name",
+    "panel_customer",
+    "custom_panel_customer",
+    "panel",
+    "custom_panel",
+)
+
+
+def _clean(value):
+    return re.sub(r"\s+", " ", (value or "").strip())
+
+
+def _clean_lower(value):
+    return _clean(value).lower()
+
+
+def _meta_has_field(doctype, fieldname):
+    try:
+        return frappe.get_meta(doctype).has_field(fieldname)
+    except Exception:
+        return False
+
+
+def _pick_doc_field(doc, candidates):
+    meta = frappe.get_meta(doc.doctype)
+    for fieldname in candidates:
+        if meta.has_field(fieldname):
+            return fieldname
+    return None
+
+
+def _panel_flag_field(create_if_missing=False):
+    meta = frappe.get_meta("Customer")
+
+    if meta.has_field("is_panel"):
+        return "is_panel"
+
+    if meta.has_field("custom_is_panel"):
+        return "custom_is_panel"
+
+    if create_if_missing:
+        frappe.get_doc({
+            "doctype": "Custom Field",
+            "dt": "Customer",
+            "label": "Is Panel",
+            "fieldname": "is_panel",
+            "fieldtype": "Check",
+            "insert_after": "customer_group",
+            "description": "Marks this Customer as a Panel for KPWS patient billing."
+        }).insert(ignore_permissions=True)
+
+        frappe.clear_cache(doctype="Customer")
+        return "is_panel"
+
+    return None
+
+
+def _get_tree_parent(doctype, preferred_name, parent_field):
+    if frappe.db.exists(doctype, preferred_name):
+        return preferred_name
+
+    parent = frappe.db.get_value(doctype, {"is_group": 1}, "name", order_by="lft asc")
+    return parent
+
+
+def ensure_customer_group(name):
+    if frappe.db.exists("Customer Group", name):
+        return
+
+    parent = _get_tree_parent("Customer Group", "All Customer Groups", "parent_customer_group")
+
+    doc = frappe.get_doc({
+        "doctype": "Customer Group",
+        "customer_group_name": name,
+        "parent_customer_group": parent,
+        "is_group": 0,
+    })
+    doc.insert(ignore_permissions=True)
+
+
+def ensure_territory(name="Pakistan"):
+    if frappe.db.exists("Territory", name):
+        return
+
+    parent = _get_tree_parent("Territory", "All Territories", "parent_territory")
+
+    doc = frappe.get_doc({
+        "doctype": "Territory",
+        "territory_name": name,
+        "parent_territory": parent,
+        "is_group": 0,
+    })
+    doc.insert(ignore_permissions=True)
+
+
+def ensure_masters():
+    for group in ALLOWED_CUSTOMER_GROUPS:
+        ensure_customer_group(group)
+
+    ensure_territory("Pakistan")
+    _panel_flag_field(create_if_missing=True)
+
+
+def _find_duplicate_panel_customer(panel_name, exclude=None):
+    flag_field = _panel_flag_field(create_if_missing=True)
+    target = _clean_lower(panel_name)
+
+    rows = frappe.get_all(
+        "Customer",
+        fields=["name", "customer_name", flag_field],
+        limit_page_length=0,
+    )
+
+    for row in rows:
+        if exclude and row.name == exclude:
+            continue
+
+        if not cint(row.get(flag_field)):
+            continue
+
+        if _clean_lower(row.customer_name) == target or _clean_lower(row.name) == target:
+            return row.name
+
+    return None
+
+
+def validate_customer_panel_rules(doc, method=None):
+    flag_field = _panel_flag_field(create_if_missing=True)
+
+    if doc.get("customer_group") == "Panel":
+        doc.set(flag_field, 1)
+
+    if cint(doc.get(flag_field)):
+        panel_name = _clean(doc.get("customer_name") or doc.name)
+
+        if not panel_name:
+            frappe.throw(_("Panel customer name is required."))
+
+        duplicate = _find_duplicate_panel_customer(panel_name, exclude=doc.name)
+        if duplicate:
+            frappe.throw(
+                _("Panel customer already exists: {0}").format(
+                    frappe.bold(duplicate)
+                )
+            )
+
+        doc.customer_group = "Panel"
+        doc.territory = "Pakistan"
+
+
+def validate_patient_customer_rules(doc, method=None):
+    group_field = _pick_doc_field(doc, PATIENT_GROUP_FIELDS)
+    panel_field = _pick_doc_field(doc, PATIENT_PANEL_FIELDS)
+
+    if not group_field:
+        return
+
+    group = _clean(doc.get(group_field))
+
+    if group and group not in ALLOWED_CUSTOMER_GROUPS:
+        frappe.throw(
+            _("Only Cash, Welfare and Panel are allowed in Customer Group.")
+        )
+
+    if group == "Panel":
+        if panel_field and not doc.get(panel_field):
+            frappe.throw(_("Panel Name is required when Customer Group is Panel."))
+
+        if panel_field and doc.get(panel_field):
+            flag_field = _panel_flag_field(create_if_missing=True)
+            customer = frappe.db.get_value(
+                "Customer",
+                doc.get(panel_field),
+                ["name", "customer_name", flag_field],
+                as_dict=True,
+            )
+
+            if not customer:
+                frappe.throw(_("Selected Panel customer does not exist."))
+
+            if not cint(customer.get(flag_field)):
+                frappe.throw(
+                    _("Selected Panel Name must be a Customer with Is Panel checked.")
+                )
+
+    else:
+        if panel_field and doc.get(panel_field):
+            doc.set(panel_field, None)
+
+
+validate_and_sanitize = getattr(
+    frappe,
+    "validate_and_sanitize_search_inputs",
+    lambda fn: fn
+)
+
+
+@frappe.whitelist()
+@validate_and_sanitize
+def panel_customer_query(doctype, txt, searchfield, start, page_len, filters):
+    flag_field = _panel_flag_field(create_if_missing=True)
+    flag_sql = f"`{flag_field}`"
+
+    return frappe.db.sql(
+        f"""
+        SELECT
+            name,
+            customer_name,
+            customer_group
+        FROM `tabCustomer`
+        WHERE
+            IFNULL(disabled, 0) = 0
+            AND IFNULL({flag_sql}, 0) = 1
+            AND (
+                name LIKE %(txt)s
+                OR customer_name LIKE %(txt)s
+            )
+        ORDER BY customer_name ASC
+        LIMIT %(start)s, %(page_len)s
+        """,
+        {
+            "txt": f"%{txt or ''}%",
+            "start": int(start or 0),
+            "page_len": int(page_len or 20),
+        },
+    )
+
+
+@frappe.whitelist()
+def create_panel_customer(panel_name):
+    ensure_masters()
+
+    if not (
+        frappe.has_permission("Patient", "write")
+        or frappe.has_permission("Customer", "create")
+        or "System Manager" in frappe.get_roles()
+    ):
+        frappe.throw(_("Not permitted to create Panel customer."), frappe.PermissionError)
+
+    panel_name = _clean(panel_name)
+
+    if not panel_name:
+        frappe.throw(_("Panel name is required."))
+
+    duplicate = _find_duplicate_panel_customer(panel_name)
+    if duplicate:
+        frappe.throw(
+            _("Panel customer already exists: {0}").format(frappe.bold(duplicate))
+        )
+
+    flag_field = _panel_flag_field(create_if_missing=True)
+
+    customer = frappe.get_doc({
+        "doctype": "Customer",
+        "customer_name": panel_name,
+        "customer_type": "Company",
+        "customer_group": "Panel",
+        "territory": "Pakistan",
+        flag_field: 1,
+    })
+
+    customer.insert(ignore_permissions=True)
+
+    return {
+        "customer": customer.name,
+        "customer_name": customer.customer_name,
+    }
+
+
+CLIENT_SCRIPT = r"""
+const KPWS_ALLOWED_GROUPS = ["Cash", "Welfare", "Panel"];
+
+function kpws_pick_patient_field(frm, fields) {
+    for (const fieldname of fields) {
+        if (frm.fields_dict[fieldname]) {
+            return fieldname;
+        }
+    }
+    return null;
+}
+
+function kpws_customer_group_field(frm) {
+    return kpws_pick_patient_field(frm, [
+        "customer_group",
+        "custom_customer_group",
+        "billing_type",
+        "custom_billing_type"
+    ]);
+}
+
+function kpws_panel_field(frm) {
+    return kpws_pick_patient_field(frm, [
+        "panel_name",
+        "custom_panel_name",
+        "panel_customer",
+        "custom_panel_customer",
+        "panel",
+        "custom_panel"
+    ]);
+}
+
+function kpws_apply_patient_customer_rules(frm) {
+    const group_field = kpws_customer_group_field(frm);
+    const panel_field = kpws_panel_field(frm);
+
+    if (group_field) {
+        const group_ctrl = frm.fields_dict[group_field];
+
+        if (group_ctrl.df.fieldtype === "Link") {
+            frm.set_query(group_field, function() {
+                return {
+                    filters: {
+                        name: ["in", KPWS_ALLOWED_GROUPS]
+                    }
+                };
+            });
+
+            group_ctrl.df.only_select = 1;
+            group_ctrl.only_select = true;
+
+            group_ctrl.new_doc = function() {
+                frappe.msgprint(__("Only Cash, Welfare and Panel are allowed. New Customer Groups cannot be created here."));
+            };
+        }
+
+        if (group_ctrl.df.fieldtype === "Select") {
+            frm.set_df_property(group_field, "options", KPWS_ALLOWED_GROUPS.join("\n"));
+        }
+    }
+
+    if (panel_field) {
+        const panel_ctrl = frm.fields_dict[panel_field];
+
+        if (panel_ctrl.df.fieldtype === "Link") {
+            frm.set_query(panel_field, function() {
+                return {
+                    query: "kpws_customization.api.kpws_patient_customer_rules.panel_customer_query"
+                };
+            });
+        }
+    }
+
+    kpws_sync_panel_visibility(frm);
+}
+
+function kpws_sync_panel_visibility(frm) {
+    const group_field = kpws_customer_group_field(frm);
+    const panel_field = kpws_panel_field(frm);
+
+    if (!group_field || !panel_field) {
+        return;
+    }
+
+    const is_panel = frm.doc[group_field] === "Panel";
+
+    frm.set_df_property(panel_field, "hidden", !is_panel);
+    frm.set_df_property(panel_field, "reqd", is_panel);
+
+    if (!is_panel && frm.doc[panel_field]) {
+        frm.set_value(panel_field, null);
+    }
+}
+
+function kpws_add_create_panel_button(frm) {
+    const group_field = kpws_customer_group_field(frm);
+    const panel_field = kpws_panel_field(frm);
+
+    if (!group_field || !panel_field) {
+        return;
+    }
+
+    if (frm.doc[group_field] !== "Panel") {
+        return;
+    }
+
+    frm.add_custom_button(__("Create New Panel"), function() {
+        const d = new frappe.ui.Dialog({
+            title: __("Create New Panel"),
+            fields: [
+                {
+                    fieldname: "panel_name",
+                    fieldtype: "Data",
+                    label: __("Panel Name"),
+                    reqd: 1
+                }
+            ],
+            primary_action_label: __("Create Panel"),
+            primary_action(values) {
+                frappe.call({
+                    method: "kpws_customization.api.kpws_patient_customer_rules.create_panel_customer",
+                    args: {
+                        panel_name: values.panel_name
+                    },
+                    freeze: true,
+                    freeze_message: __("Creating Panel..."),
+                    callback(r) {
+                        if (!r.message || !r.message.customer) {
+                            return;
+                        }
+
+                        frm.set_value(group_field, "Panel");
+                        frm.set_value(panel_field, r.message.customer);
+
+                        d.hide();
+
+                        frappe.show_alert({
+                            message: __("Panel created and selected."),
+                            indicator: "green"
+                        });
+                    }
+                });
+            }
+        });
+
+        d.show();
+    }, __("Panel"));
+}
+
+frappe.ui.form.on("Patient", {
+    setup(frm) {
+        kpws_apply_patient_customer_rules(frm);
+    },
+
+    refresh(frm) {
+        kpws_apply_patient_customer_rules(frm);
+        kpws_add_create_panel_button(frm);
+    },
+
+    customer_group(frm) {
+        kpws_sync_panel_visibility(frm);
+    },
+
+    custom_customer_group(frm) {
+        kpws_sync_panel_visibility(frm);
+    },
+
+    billing_type(frm) {
+        kpws_sync_panel_visibility(frm);
+    },
+
+    custom_billing_type(frm) {
+        kpws_sync_panel_visibility(frm);
+    }
+});
+"""
+
+
+def install_client_script():
+    name = "KPWS Patient Customer Panel Rules"
+
+    existing = frappe.db.exists("Client Script", name)
+
+    if existing:
+        doc = frappe.get_doc("Client Script", existing)
+    else:
+        doc = frappe.new_doc("Client Script")
+        doc.name = name
+        doc.dt = "Patient"
+
+    doc.dt = "Patient"
+    doc.script = CLIENT_SCRIPT
+
+    if doc.meta.has_field("view"):
+        doc.view = "Form"
+
+    if doc.meta.has_field("enabled"):
+        doc.enabled = 1
+
+    doc.save(ignore_permissions=True)
+
+
+@frappe.whitelist()
+def install():
+    ensure_masters()
+    install_client_script()
+    frappe.db.commit()
+    return "KPWS Patient Customer/Panel rules installed."

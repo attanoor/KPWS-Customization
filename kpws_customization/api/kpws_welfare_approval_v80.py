@@ -1,0 +1,1838 @@
+import json
+import re
+import frappe
+from frappe.utils import flt, cint, now_datetime
+
+PRF_DT = "Patient Registration Form"
+PATIENT_DT = "Patient"
+CUSTOMER_DT = "Customer"
+
+WELFARE_SOURCES = ("Zakat", "Donation", "Panel")
+
+# KPWS_AUDIT_PATCH_D_20260620: Patient address is editable on Welfare Approval
+# and mirrored to Patient Registration Form for audit/display.
+ADDRESS_FIELDS = [
+    ("address_line1", "custom_kpws_address_line1", "Address Line 1"),
+    ("address_line2", "custom_kpws_address_line2", "Address Line 2"),
+    ("area_mohalla", "custom_kpws_area_mohalla", "Area / Mohalla"),
+    ("city", "custom_kpws_city", "City"),
+    ("district", "custom_kpws_district", "District"),
+    ("province", "custom_kpws_province", "Province"),
+    ("postal_code", "custom_kpws_postal_code", "Postal Code"),
+    ("country", "custom_kpws_country", "Country"),
+]
+
+
+def _address_from_doc(doc):
+    return {key: doc.get(fieldname) if doc and doc.meta.has_field(fieldname) else "" for key, fieldname, _label in ADDRESS_FIELDS}
+
+
+def _address_text(values):
+    order = ["address_line1", "address_line2", "area_mohalla", "city", "district", "province", "postal_code", "country"]
+    return "\n".join([str(values.get(k) or "").strip() for k in order if str(values.get(k) or "").strip()])
+
+
+def _require_admin():
+    roles = set(frappe.get_roles(frappe.session.user))
+    allowed = {"System Manager", "Administrator", "Accounts Manager", "Healthcare Administrator"}
+
+    if frappe.session.user == "Administrator":
+        return
+
+    if not roles.intersection(allowed):
+        frappe.throw("Only Administrator/System Manager can use Welfare Approval Panel.")
+
+
+def _has(dt, fieldname):
+    try:
+        return frappe.get_meta(dt).has_field(fieldname)
+    except Exception:
+        return False
+
+
+def _safe_get(doc, fieldname, default=None):
+    if doc and doc.meta.has_field(fieldname):
+        return doc.get(fieldname)
+    return default
+
+
+def _parse_payload(payload=None):
+    if not payload:
+        return {}
+
+    if isinstance(payload, dict):
+        return dict(payload)
+
+    if isinstance(payload, str):
+        try:
+            return json.loads(payload)
+        except Exception:
+            return {}
+
+    try:
+        return dict(payload)
+    except Exception:
+        return {}
+
+
+def _norm(txt):
+    return re.sub(r"[^a-z0-9]+", "", (txt or "").lower())
+
+
+def _find_patient_field(labels=None, keywords=None, avoid=None):
+    labels = labels or []
+    keywords = keywords or []
+    avoid = set(avoid or [])
+
+    meta = frappe.get_meta(PATIENT_DT)
+    candidates = []
+
+    for df in meta.fields:
+        fieldname = df.fieldname
+        label = df.label or ""
+
+        if not fieldname or not isinstance(fieldname, str):
+            continue
+
+        combined = (fieldname + " " + label).lower()
+        score = 0
+
+        for lbl in labels:
+            if lbl.lower() == label.lower():
+                score += 100
+            elif lbl.lower() in label.lower():
+                score += 70
+
+        for kw in keywords:
+            if kw.lower() in combined:
+                score += 20
+
+        if fieldname in avoid:
+            score -= 20
+
+        if score > 0:
+            candidates.append((score, fieldname))
+
+    candidates.sort(reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+def _relation_field():
+    return _find_patient_field(
+        labels=["Son of/Daughter of/Wife of", "Father/Husband Name", "Guardian Name"],
+        keywords=["son", "daughter", "wife", "father", "husband", "guardian", "relation"],
+        avoid=["custom_kpws_relation_name"],
+    )
+
+
+def _old_kpws_field():
+    return _find_patient_field(
+        labels=["Old KPWS Number", "Old KPWS No"],
+        keywords=["old", "kpws"],
+        avoid=["custom_old_kpws_number"],
+    )
+
+
+def _prf_patient_field():
+    if _has(PRF_DT, "custom_patient"):
+        return "custom_patient"
+    if _has(PRF_DT, "patient"):
+        return "patient"
+    return None
+
+
+def _patient_display_name(p):
+    if not p:
+        return ""
+    return (
+        p.get("patient_name")
+        or " ".join([str(p.get("first_name") or ""), str(p.get("last_name") or "")]).strip()
+        or p.name
+    )
+
+
+def _validate_panel_customer(panel_customer):
+    if not panel_customer:
+        frappe.throw("Panel Customer is required.")
+
+    if not frappe.db.exists(CUSTOMER_DT, panel_customer):
+        frappe.throw("Selected Panel Customer does not exist.")
+
+    if _has(CUSTOMER_DT, "custom_is_panel"):
+        is_panel = cint(frappe.db.get_value(CUSTOMER_DT, panel_customer, "custom_is_panel") or 0)
+        if is_panel != 1:
+            frappe.throw("Selected Customer is not marked as Is Panel.")
+
+
+def _prf_funding(prf):
+    return (
+        _safe_get(prf, "custom_kpws_funding_source")
+        or _safe_get(prf, "custom_kpws_welfare_type")
+        or _safe_get(prf, "purpose")
+        or ""
+    )
+
+
+def _prf_percentage(prf):
+    return flt(
+        _safe_get(prf, "custom_kpws_welfare_percentage")
+        or _safe_get(prf, "discount_value")
+        or 0
+    )
+
+
+def _prf_panel(prf):
+    return (
+        _safe_get(prf, "custom_panel_customer")
+        or _safe_get(prf, "custom_kpws_assigned_panel_customer")
+        or ""
+    )
+
+
+def _patient_data(patient):
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        return {}
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+
+    rel_field = _relation_field()
+    old_field = _old_kpws_field()
+
+    data = {
+        "name": p.name,
+        "patient_name": _patient_display_name(p),
+        "first_name": p.get("first_name"),
+        "last_name": p.get("last_name"),
+        "relation_name": p.get(rel_field) if rel_field else "",
+        "relation_fieldname": rel_field,
+        "age": p.get("age_"),
+        "sex": p.get("sex"),
+        "mobile": p.get("custom_kpws_mobile_no") or p.get("mobile"),
+        "cnic": p.get("custom_kpws_cnic") or p.get("cnic_number"),
+        "mr_number": p.get("custom_reference_number"),
+        "old_kpws_number": p.get(old_field) if old_field else "",
+        "old_kpws_fieldname": old_field,
+        "patient_status": p.get("patient_status"),
+        "patient_type": p.get("customer_group"),
+        "funding_source": p.get("custom_kpws_funding_source") if _has(PATIENT_DT, "custom_kpws_funding_source") else "",
+        "panel_customer": p.get("custom_panel_customer") if _has(PATIENT_DT, "custom_panel_customer") else "",
+        "customer": p.get("customer"),
+        "customer_name": frappe.db.get_value(CUSTOMER_DT, p.get("customer"), "customer_name") if p.get("customer") else "",
+        "patient_details": p.get("patient_details"),
+    }
+    data.update(_address_from_doc(p))
+    return data
+
+
+@frappe.whitelist()
+def get_counts():
+    _require_admin()
+
+    patient_field = _prf_patient_field()
+    if not patient_field:
+        return {"pending": 0, "approved": 0, "rejected": 0, "total": 0}
+
+    pending = frappe.db.count(PRF_DT, {
+        "docstatus": 0,
+        "workflow_state": ["in", ["Pending Approval", "Draft", ""]]
+    })
+
+    approved = frappe.db.count(PRF_DT, {"workflow_state": "Approved"})
+    rejected = frappe.db.count(PRF_DT, {"workflow_state": "Rejected"})
+    total = frappe.db.count(PRF_DT)
+
+    return {
+        "pending": pending,
+        "approved": approved,
+        "rejected": rejected,
+        "total": total,
+    }
+
+
+@frappe.whitelist()
+def search_requests(txt=None, status="Pending", limit=50):
+    _require_admin()
+
+    txt = (txt or "").strip()
+    status = status or "Pending"
+    limit = cint(limit or 50)
+
+    patient_field = _prf_patient_field()
+    if not patient_field:
+        frappe.throw("Patient field not found on Patient Registration Form.")
+
+    where = []
+    params = {"limit": limit}
+
+    if status == "Pending":
+        where.append("(prf.docstatus = 0 AND IFNULL(prf.workflow_state, '') IN ('Pending Approval', 'Draft', ''))")
+    elif status == "Approved":
+        where.append("(prf.workflow_state = 'Approved' OR prf.docstatus = 1)")
+    elif status == "Rejected":
+        where.append("prf.workflow_state = 'Rejected'")
+    elif status == "All":
+        where.append("1=1")
+    else:
+        where.append("1=1")
+
+    if txt:
+        params["txt"] = "%" + txt + "%"
+        where.append("""
+            (
+                prf.name LIKE %(txt)s
+                OR p.name LIKE %(txt)s
+                OR p.patient_name LIKE %(txt)s
+                OR p.first_name LIKE %(txt)s
+                OR p.last_name LIKE %(txt)s
+                OR p.custom_reference_number LIKE %(txt)s
+                OR p.custom_kpws_cnic LIKE %(txt)s
+                OR p.cnic_number LIKE %(txt)s
+            )
+        """)
+
+    where_sql = " AND ".join(where)
+
+    rows = frappe.db.sql(f"""
+        SELECT
+            prf.name,
+            prf.docstatus,
+            IFNULL(prf.workflow_state, '') AS workflow_state,
+            prf.modified,
+            prf.`{patient_field}` AS patient,
+            COALESCE(prf.custom_kpws_funding_source, prf.custom_kpws_welfare_type, prf.purpose, '') AS funding_source,
+            COALESCE(prf.custom_kpws_welfare_percentage, prf.discount_value, 0) AS percentage,
+            IFNULL(prf.custom_panel_customer, '') AS panel_customer,
+            p.patient_name,
+            p.first_name,
+            p.last_name,
+            p.custom_reference_number,
+            p.custom_kpws_cnic,
+            p.cnic_number,
+            p.customer_group
+        FROM `tabPatient Registration Form` prf
+        LEFT JOIN `tabPatient` p ON p.name = prf.`{patient_field}`
+        WHERE {where_sql}
+        ORDER BY
+            CASE
+                WHEN IFNULL(prf.workflow_state, '') = 'Pending Approval' THEN 0
+                WHEN IFNULL(prf.workflow_state, '') = 'Draft' THEN 1
+                ELSE 2
+            END,
+            prf.modified DESC
+        LIMIT %(limit)s
+    """, params, as_dict=True)
+
+    return rows
+
+
+@frappe.whitelist()
+def get_request(name=None):
+    _require_admin()
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Patient Registration request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    patient_field = _prf_patient_field()
+    patient = prf.get(patient_field) if patient_field else None
+
+    return {
+        "ok": True,
+        "request": {
+            "name": prf.name,
+            "docstatus": prf.docstatus,
+            "workflow_state": prf.get("workflow_state"),
+            "patient": patient,
+            "funding_source": _prf_funding(prf),
+            "percentage": _prf_percentage(prf),
+            "panel_customer": _prf_panel(prf),
+            "modified": str(prf.modified),
+        },
+        "patient": _patient_data(patient),
+        "counts": get_counts(),
+    }
+
+
+def _save_patient_from_request(patient, data):
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Linked Patient not found.")
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+    old_customer = p.get("customer")
+
+    relation_field = _relation_field()
+    old_kpws_field = _old_kpws_field()
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if fieldname and _has(PATIENT_DT, fieldname):
+            if value not in (None, "") or allow_blank:
+                updates[fieldname] = value or ""
+
+    add("first_name", data.get("first_name"), allow_blank=False)
+    add("last_name", data.get("last_name"))
+    add("age_", data.get("age"), allow_blank=False)
+    add("sex", data.get("sex"), allow_blank=False)
+    add("mobile", data.get("mobile"))
+    add("custom_kpws_mobile_no", data.get("mobile"))
+    add("custom_kpws_cnic", data.get("cnic"), allow_blank=False)
+    add("cnic_number", data.get("cnic"))
+    add("custom_reference_number", data.get("mr_number"))
+    add("patient_status", data.get("patient_status") or "SE")
+    add("patient_details", data.get("patient_details"))
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add(relation_field, data.get("relation_name"))
+    add(old_kpws_field, data.get("old_kpws_number"))
+
+    # Approval panel is only for welfare request, so Patient Type remains Welfare.
+    add("customer_group", "Welfare")
+    add("custom_kpws_funding_source", data.get("funding_source"))
+    add("custom_panel_customer", data.get("panel_customer"))
+
+    if data.get("funding_source") in ("Zakat", "Donation"):
+        if _has(PATIENT_DT, "custom_panel_customer"):
+            updates["custom_panel_customer"] = ""
+
+    frappe.db.set_value(PATIENT_DT, patient, updates, update_modified=True)
+
+    # Critical: never replace existing Patient.customer from this admin screen.
+    if old_customer and _has(PATIENT_DT, "customer"):
+        frappe.db.set_value(PATIENT_DT, patient, "customer", old_customer, update_modified=False)
+
+
+def _save_prf(name, data, workflow_state=None):
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Patient Registration request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    # KPWS_AUDIT_PATCH_D_20260620:
+    # Administrator/System Manager can edit request values after save/approval.
+    # Direct db updates below preserve submitted status and avoid cancel/resubmit.
+    was_submitted = cint(prf.docstatus) == 1
+
+    funding = data.get("funding_source")
+    percentage = flt(data.get("percentage") or 0)
+    panel_customer = data.get("panel_customer") or ""
+
+    if funding not in WELFARE_SOURCES:
+        frappe.throw("Funding Source must be Zakat, Donation, or Panel.")
+
+    if funding == "Panel":
+        _validate_panel_customer(panel_customer)
+    else:
+        panel_customer = ""
+        if percentage <= 0:
+            frappe.throw("Percentage must be greater than zero for Zakat/Donation.")
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if _has(PRF_DT, fieldname):
+            updates[fieldname] = value if value not in (None, "") else ""
+
+    add("purpose", funding)
+    add("custom_kpws_welfare_type", funding)
+    add("custom_kpws_funding_source", funding)
+    add("discount_value", percentage)
+    add("custom_kpws_welfare_percentage", percentage)
+    add("custom_panel_customer", panel_customer)
+    add("custom_kpws_assigned_panel_customer", panel_customer)
+    address_values = {key: data.get(key) or "" for key, _fieldname, _label in ADDRESS_FIELDS}
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add("address", _address_text(address_values))
+
+    if workflow_state and _has(PRF_DT, "workflow_state"):
+        updates["workflow_state"] = workflow_state
+    if was_submitted and _has(PRF_DT, "workflow_state"):
+        updates["workflow_state"] = prf.get("workflow_state") or "Approved"
+
+    frappe.db.set_value(PRF_DT, name, updates, update_modified=True)
+
+
+@frappe.whitelist()
+def save_request(payload=None):
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+    patient = data.get("patient")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    if not patient:
+        prf = frappe.get_doc(PRF_DT, name)
+        patient_field = _prf_patient_field()
+        patient = prf.get(patient_field)
+
+    _save_patient_from_request(patient, data)
+    existing = frappe.get_doc(PRF_DT, name)
+    next_state = "Pending Approval"
+    if cint(existing.docstatus) == 1 or existing.get("workflow_state") == "Approved":
+        next_state = existing.get("workflow_state") or "Approved"
+    _save_prf(name, data, workflow_state=next_state)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment("Info", "Updated from KPWS Welfare Approval Panel at {0}".format(now_datetime()))
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def approve_request(payload=None):
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    # Save latest admin changes first.
+    saved = save_request(payload=json.dumps(data))
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    if prf.docstatus == 1:
+        return get_request(name)
+
+    if _has(PRF_DT, "workflow_state"):
+        frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        prf.reload()
+        prf.flags.ignore_permissions = True
+        prf.flags.ignore_workflow = True
+        frappe.flags.ignore_workflow = True
+        prf.submit()
+    except Exception:
+        # Keep Approved state even if workflow submit is blocked.
+        if _has(PRF_DT, "workflow_state"):
+            frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment("Info", "Approved from KPWS Welfare Approval Panel at {0}".format(now_datetime()))
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def reject_request(name=None, reason=None):
+    _require_admin()
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    if prf.docstatus == 1:
+        frappe.throw("Approved/submitted request cannot be rejected. Cancel it first if required.")
+
+    if _has(PRF_DT, "workflow_state"):
+        frappe.db.set_value(PRF_DT, name, "workflow_state", "Rejected", update_modified=True)
+
+    try:
+        prf.add_comment("Comment", reason or "Rejected from KPWS Welfare Approval Panel.")
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def get_panel_customers(txt=None):
+    _require_admin()
+
+    txt = (txt or "").strip().lower()
+
+    if not _has(CUSTOMER_DT, "custom_is_panel"):
+        return []
+
+    rows = frappe.get_all(
+        CUSTOMER_DT,
+        filters={"custom_is_panel": 1},
+        fields=["name", "customer_name"],
+        order_by="customer_name asc",
+        limit=500,
+    )
+
+    if txt:
+        rows = [
+            r for r in rows
+            if txt in (r.name or "").lower() or txt in (r.customer_name or "").lower()
+        ]
+
+    return [{"value": r.name, "label": r.customer_name or r.name} for r in rows]
+
+
+# KPWS_WELFARE_APPROVAL_ADMIN_OVERRIDE_APPROVED_V81
+def _kpws_v81_save_prf_any_status(name, data, workflow_state=None):
+    """
+    Admin override save for Patient Registration Form.
+
+    Works for:
+    - Draft / Pending Approval PRF
+    - Approved / Submitted PRF
+
+    Important:
+    We do direct db.set_value because submitted docs cannot be saved normally.
+    """
+    import frappe
+    from frappe.utils import flt
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Patient Registration request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    funding = data.get("funding_source")
+    percentage = flt(data.get("percentage") or 0)
+    panel_customer = data.get("panel_customer") or ""
+
+    if funding not in WELFARE_SOURCES:
+        frappe.throw("Funding Source must be Zakat, Donation, or Panel.")
+
+    if funding == "Panel":
+        _validate_panel_customer(panel_customer)
+    else:
+        panel_customer = ""
+        if percentage <= 0:
+            frappe.throw("Percentage must be greater than zero for Zakat/Donation.")
+
+    # If already approved, keep it approved unless explicitly rejected.
+    final_workflow_state = workflow_state
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        final_workflow_state = "Approved"
+
+    updates = {}
+
+    def add(fieldname, value):
+        if _has(PRF_DT, fieldname):
+            updates[fieldname] = value if value not in (None, "") else ""
+
+    add("purpose", funding)
+    add("custom_kpws_welfare_type", funding)
+    add("custom_kpws_funding_source", funding)
+    add("discount_value", percentage)
+    add("custom_kpws_welfare_percentage", percentage)
+    add("custom_panel_customer", panel_customer)
+    add("custom_kpws_assigned_panel_customer", panel_customer)
+
+    if final_workflow_state and _has(PRF_DT, "workflow_state"):
+        updates["workflow_state"] = final_workflow_state
+
+    if updates:
+        frappe.db.set_value(PRF_DT, name, updates, update_modified=True)
+
+    return {
+        "docstatus": prf.docstatus,
+        "workflow_state": final_workflow_state or prf.get("workflow_state"),
+    }
+
+
+def _kpws_v81_save_patient_from_request_any_status(patient, data):
+    """
+    Admin override save for linked Patient.
+
+    Does not create or replace Customer.
+    Updates patient demographics + welfare classification.
+    """
+    import frappe
+
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Linked Patient not found.")
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+    old_customer = p.get("customer")
+
+    relation_field = _relation_field()
+    old_kpws_field = _old_kpws_field()
+
+    funding = data.get("funding_source")
+    panel_customer = data.get("panel_customer") or ""
+
+    if funding in ("Zakat", "Donation"):
+        panel_customer = ""
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if fieldname and _has(PATIENT_DT, fieldname):
+            if value not in (None, "") or allow_blank:
+                updates[fieldname] = value or ""
+
+    add("first_name", data.get("first_name"), allow_blank=False)
+    add("last_name", data.get("last_name"))
+    add("age_", data.get("age"), allow_blank=False)
+    add("sex", data.get("sex"), allow_blank=False)
+    add("mobile", data.get("mobile"))
+    add("custom_kpws_mobile_no", data.get("mobile"))
+    add("custom_kpws_cnic", data.get("cnic"), allow_blank=False)
+    add("cnic_number", data.get("cnic"))
+    add("custom_reference_number", data.get("mr_number"))
+    add("patient_status", data.get("patient_status") or "SE")
+    add("patient_details", data.get("patient_details"))
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add(relation_field, data.get("relation_name"))
+    add(old_kpws_field, data.get("old_kpws_number"))
+
+    # Approved welfare form should keep Patient as Welfare.
+    add("customer_group", "Welfare")
+    add("custom_kpws_funding_source", funding)
+    add("custom_panel_customer", panel_customer)
+
+    if updates:
+        frappe.db.set_value(PATIENT_DT, patient, updates, update_modified=True)
+
+    # Critical: never replace linked Customer from this approval panel.
+    if old_customer and _has(PATIENT_DT, "customer"):
+        frappe.db.set_value(PATIENT_DT, patient, "customer", old_customer, update_modified=False)
+
+
+@frappe.whitelist()
+def save_request(payload=None):
+    """
+    Override original save_request.
+
+    Allows Administrator to update even approved/submitted requests.
+    For approved request, it keeps workflow_state Approved and docstatus unchanged.
+    """
+    import json
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    patient_field = _prf_patient_field()
+    patient = data.get("patient") or (prf.get(patient_field) if patient_field else None)
+
+    if not patient:
+        frappe.throw("Linked Patient not found on request.")
+
+    # Preserve approved status when already approved/submitted.
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        next_state = "Approved"
+        action_note = "Approved request overridden"
+    else:
+        next_state = "Pending Approval"
+        action_note = "Pending request updated"
+
+    _kpws_v81_save_patient_from_request_any_status(patient, data)
+    _kpws_v81_save_prf_any_status(name, data, workflow_state=next_state)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "{0} from KPWS Welfare Approval Panel by {1} at {2}".format(
+                action_note,
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def approve_request(payload=None):
+    """
+    Override original approve_request.
+
+    If already approved, this behaves like Admin Override Save.
+    If pending, it approves normally.
+    """
+    import json
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    # First save latest values.
+    data["name"] = name
+    _kpws_v81_save_patient_from_request_any_status(
+        prf.get(_prf_patient_field()),
+        data,
+    )
+    _kpws_v81_save_prf_any_status(name, data, workflow_state="Approved")
+
+    prf.reload()
+
+    if prf.docstatus != 1:
+        try:
+            prf.flags.ignore_permissions = True
+            prf.flags.ignore_workflow = True
+            frappe.flags.ignore_workflow = True
+            prf.submit()
+        except Exception:
+            # Keep workflow approved even if submit blocked by workflow.
+            if _has(PRF_DT, "workflow_state"):
+                frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "Approved/overridden from KPWS Welfare Approval Panel by {0} at {1}".format(
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def reopen_approved_request(name=None):
+    """
+    Optional admin action:
+    Reopens the approved request for visual review only.
+    Does not cancel docstatus. It only changes workflow_state to Pending Approval.
+    Use only if you want it to appear again in Pending list.
+    """
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    if _has(PRF_DT, "workflow_state"):
+        frappe.db.set_value(PRF_DT, name, "workflow_state", "Pending Approval", update_modified=True)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "Approved request reopened from KPWS Welfare Approval Panel by {0} at {1}".format(
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+# KPWS_WELFARE_APPROVAL_ZAKAT_DONATION_OPTIONAL_PANEL_V83
+def _kpws_v83_normalize_welfare_decision(data):
+    """
+    Final welfare approval rule:
+    - Zakat: panel optional
+    - Donation: panel optional
+    - Panel: panel required
+    """
+    import frappe
+    from frappe.utils import flt
+
+    funding = data.get("funding_source")
+    percentage = flt(data.get("percentage") or 0)
+    panel_customer = data.get("panel_customer") or ""
+
+    if funding not in WELFARE_SOURCES:
+        frappe.throw("Funding Source must be Zakat, Donation, or Panel.")
+
+    if funding == "Panel":
+        if not panel_customer:
+            frappe.throw("Panel Customer is required when Funding Source is Panel.")
+
+        _validate_panel_customer(panel_customer)
+        percentage = 100
+
+    elif funding in ("Zakat", "Donation"):
+        # New rule: both Zakat and Donation may optionally have a Panel Customer.
+        if panel_customer:
+            _validate_panel_customer(panel_customer)
+
+        if percentage <= 0:
+            frappe.throw("Percentage must be greater than zero for {0}.".format(funding))
+
+    return funding, percentage, panel_customer
+
+
+def _kpws_v83_save_prf_any_status(name, data, workflow_state=None):
+    import frappe
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Patient Registration request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    funding, percentage, panel_customer = _kpws_v83_normalize_welfare_decision(data)
+
+    final_workflow_state = workflow_state
+
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        final_workflow_state = "Approved"
+
+    updates = {}
+
+    def add(fieldname, value):
+        if _has(PRF_DT, fieldname):
+            updates[fieldname] = value if value not in (None, "") else ""
+
+    add("purpose", funding)
+    add("custom_kpws_welfare_type", funding)
+    add("custom_kpws_funding_source", funding)
+    add("discount_value", percentage)
+    add("custom_kpws_welfare_percentage", percentage)
+
+    # Keep panel for Zakat, Donation, and Panel if selected.
+    add("custom_panel_customer", panel_customer)
+    add("custom_kpws_assigned_panel_customer", panel_customer)
+
+    if final_workflow_state and _has(PRF_DT, "workflow_state"):
+        updates["workflow_state"] = final_workflow_state
+
+    if updates:
+        frappe.db.set_value(PRF_DT, name, updates, update_modified=True)
+
+    return {
+        "docstatus": prf.docstatus,
+        "workflow_state": final_workflow_state or prf.get("workflow_state"),
+    }
+
+
+def _kpws_v83_save_patient_from_request(patient, data):
+    import frappe
+
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Linked Patient not found.")
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+    old_customer = p.get("customer")
+
+    funding, percentage, panel_customer = _kpws_v83_normalize_welfare_decision(data)
+
+    relation_field = _relation_field()
+    old_kpws_field = _old_kpws_field()
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if fieldname and _has(PATIENT_DT, fieldname):
+            if value not in (None, "") or allow_blank:
+                updates[fieldname] = value or ""
+
+    add("first_name", data.get("first_name"), allow_blank=False)
+    add("last_name", data.get("last_name"))
+    add("age_", data.get("age"), allow_blank=False)
+    add("sex", data.get("sex"), allow_blank=False)
+    add("mobile", data.get("mobile"))
+    add("custom_kpws_mobile_no", data.get("mobile"))
+    add("custom_kpws_cnic", data.get("cnic"), allow_blank=False)
+    add("cnic_number", data.get("cnic"))
+    add("custom_reference_number", data.get("mr_number"))
+    add("patient_status", data.get("patient_status") or "SE")
+    add("patient_details", data.get("patient_details"))
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add(relation_field, data.get("relation_name"))
+    add(old_kpws_field, data.get("old_kpws_number"))
+
+    # Keep patient Welfare and sync funding + optional panel.
+    add("customer_group", "Welfare")
+    add("custom_kpws_funding_source", funding)
+    add("custom_panel_customer", panel_customer)
+
+    if updates:
+        frappe.db.set_value(PATIENT_DT, patient, updates, update_modified=True)
+
+    # Never replace linked customer from approval panel.
+    if old_customer and _has(PATIENT_DT, "customer"):
+        frappe.db.set_value(PATIENT_DT, patient, "customer", old_customer, update_modified=False)
+
+
+@frappe.whitelist()
+def save_request(payload=None):
+    """
+    Final override:
+    Zakat and Donation both allow optional Panel Customer.
+    """
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    patient_field = _prf_patient_field()
+    patient = data.get("patient") or (prf.get(patient_field) if patient_field else None)
+
+    if not patient:
+        frappe.throw("Linked Patient not found on request.")
+
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        next_state = "Approved"
+        action_note = "Approved request overridden"
+    else:
+        next_state = "Pending Approval"
+        action_note = "Pending request updated"
+
+    _kpws_v83_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state=next_state)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "{0} from KPWS Welfare Approval Panel by {1} at {2}".format(
+                action_note,
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def approve_request(payload=None):
+    """
+    Final override:
+    Save optional panel for Zakat/Donation, then approve.
+    """
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    patient = prf.get(_prf_patient_field())
+
+    _kpws_v83_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state="Approved")
+
+    prf.reload()
+
+    if prf.docstatus != 1:
+        try:
+            prf.flags.ignore_permissions = True
+            prf.flags.ignore_workflow = True
+            frappe.flags.ignore_workflow = True
+            prf.submit()
+        except Exception:
+            if _has(PRF_DT, "workflow_state"):
+                frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "Approved/overridden from KPWS Welfare Approval Panel by {0} at {1}".format(
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+# KPWS_WELFARE_APPROVAL_ZAKAT_DONATION_OPTIONAL_PANEL_V83
+def _kpws_v83_normalize_welfare_decision(data):
+    """
+    Final welfare approval rule:
+    - Zakat: panel optional
+    - Donation: panel optional
+    - Panel: panel required
+    """
+    import frappe
+    from frappe.utils import flt
+
+    funding = data.get("funding_source")
+    percentage = flt(data.get("percentage") or 0)
+    panel_customer = data.get("panel_customer") or ""
+
+    if funding not in WELFARE_SOURCES:
+        frappe.throw("Funding Source must be Zakat, Donation, or Panel.")
+
+    if funding == "Panel":
+        if not panel_customer:
+            frappe.throw("Panel Customer is required when Funding Source is Panel.")
+
+        _validate_panel_customer(panel_customer)
+        percentage = 100
+
+    elif funding in ("Zakat", "Donation"):
+        # New rule: both Zakat and Donation may optionally have a Panel Customer.
+        if panel_customer:
+            _validate_panel_customer(panel_customer)
+
+        if percentage <= 0:
+            frappe.throw("Percentage must be greater than zero for {0}.".format(funding))
+
+    return funding, percentage, panel_customer
+
+
+def _kpws_v83_save_prf_any_status(name, data, workflow_state=None):
+    import frappe
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Patient Registration request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    funding, percentage, panel_customer = _kpws_v83_normalize_welfare_decision(data)
+
+    final_workflow_state = workflow_state
+
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        final_workflow_state = "Approved"
+
+    updates = {}
+
+    def add(fieldname, value):
+        if _has(PRF_DT, fieldname):
+            updates[fieldname] = value if value not in (None, "") else ""
+
+    add("purpose", funding)
+    add("custom_kpws_welfare_type", funding)
+    add("custom_kpws_funding_source", funding)
+    add("discount_value", percentage)
+    add("custom_kpws_welfare_percentage", percentage)
+
+    # Keep panel for Zakat, Donation, and Panel if selected.
+    add("custom_panel_customer", panel_customer)
+    add("custom_kpws_assigned_panel_customer", panel_customer)
+
+    if final_workflow_state and _has(PRF_DT, "workflow_state"):
+        updates["workflow_state"] = final_workflow_state
+
+    if updates:
+        frappe.db.set_value(PRF_DT, name, updates, update_modified=True)
+
+    return {
+        "docstatus": prf.docstatus,
+        "workflow_state": final_workflow_state or prf.get("workflow_state"),
+    }
+
+
+def _kpws_v83_save_patient_from_request(patient, data):
+    import frappe
+
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Linked Patient not found.")
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+    old_customer = p.get("customer")
+
+    funding, percentage, panel_customer = _kpws_v83_normalize_welfare_decision(data)
+
+    relation_field = _relation_field()
+    old_kpws_field = _old_kpws_field()
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if fieldname and _has(PATIENT_DT, fieldname):
+            if value not in (None, "") or allow_blank:
+                updates[fieldname] = value or ""
+
+    add("first_name", data.get("first_name"), allow_blank=False)
+    add("last_name", data.get("last_name"))
+    add("age_", data.get("age"), allow_blank=False)
+    add("sex", data.get("sex"), allow_blank=False)
+    add("mobile", data.get("mobile"))
+    add("custom_kpws_mobile_no", data.get("mobile"))
+    add("custom_kpws_cnic", data.get("cnic"), allow_blank=False)
+    add("cnic_number", data.get("cnic"))
+    add("custom_reference_number", data.get("mr_number"))
+    add("patient_status", data.get("patient_status") or "SE")
+    add("patient_details", data.get("patient_details"))
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add(relation_field, data.get("relation_name"))
+    add(old_kpws_field, data.get("old_kpws_number"))
+
+    # Keep patient Welfare and sync funding + optional panel.
+    add("customer_group", "Welfare")
+    add("custom_kpws_funding_source", funding)
+    add("custom_panel_customer", panel_customer)
+
+    if updates:
+        frappe.db.set_value(PATIENT_DT, patient, updates, update_modified=True)
+
+    # Never replace linked customer from approval panel.
+    if old_customer and _has(PATIENT_DT, "customer"):
+        frappe.db.set_value(PATIENT_DT, patient, "customer", old_customer, update_modified=False)
+
+
+@frappe.whitelist()
+def save_request(payload=None):
+    """
+    Final override:
+    Zakat and Donation both allow optional Panel Customer.
+    """
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    patient_field = _prf_patient_field()
+    patient = data.get("patient") or (prf.get(patient_field) if patient_field else None)
+
+    if not patient:
+        frappe.throw("Linked Patient not found on request.")
+
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        next_state = "Approved"
+        action_note = "Approved request overridden"
+    else:
+        next_state = "Pending Approval"
+        action_note = "Pending request updated"
+
+    _kpws_v83_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state=next_state)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "{0} from KPWS Welfare Approval Panel by {1} at {2}".format(
+                action_note,
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def approve_request(payload=None):
+    """
+    Final override:
+    Save optional panel for Zakat/Donation, then approve.
+    """
+    import frappe
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    patient = prf.get(_prf_patient_field())
+
+    _kpws_v83_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state="Approved")
+
+    prf.reload()
+
+    if prf.docstatus != 1:
+        try:
+            prf.flags.ignore_permissions = True
+            prf.flags.ignore_workflow = True
+            frappe.flags.ignore_workflow = True
+            prf.submit()
+        except Exception:
+            if _has(PRF_DT, "workflow_state"):
+                frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "Approved/overridden from KPWS Welfare Approval Panel by {0} at {1}".format(
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+# KPWS_WELFARE_APPROVAL_PATIENT_IDENTITY_FIELDS_V84
+def _kpws_v84_find_patient_field(labels=None, keywords=None):
+    labels = labels or []
+    keywords = keywords or []
+
+    meta = frappe.get_meta(PATIENT_DT)
+    candidates = []
+
+    for df in meta.fields:
+        fieldname = df.fieldname
+        label = df.label or ""
+
+        if not fieldname or not isinstance(fieldname, str):
+            continue
+
+        combined = (fieldname + " " + label).lower()
+        score = 0
+
+        for lbl in labels:
+            if lbl.lower() == label.lower():
+                score += 100
+            elif lbl.lower() in label.lower():
+                score += 70
+
+        for kw in keywords:
+            if kw.lower() in combined:
+                score += 25
+
+        if score > 0:
+            candidates.append((score, fieldname, label, df.fieldtype))
+
+    candidates.sort(reverse=True)
+
+    return candidates[0][1] if candidates else None
+
+
+def _kpws_v84_religion_field():
+    return _kpws_v84_find_patient_field(
+        labels=["Religion"],
+        keywords=["religion"]
+    )
+
+
+def _kpws_v84_sanction_field():
+    return _kpws_v84_find_patient_field(
+        labels=["Sanction", "Sanction Type", "Sanction Status"],
+        keywords=["sanction"]
+    )
+
+
+def _kpws_v84_nationality_field():
+    return _kpws_v84_find_patient_field(
+        labels=["Nationality"],
+        keywords=["nationality", "nation"]
+    )
+
+
+@frappe.whitelist()
+def debug_patient_identity_fields():
+    """
+    Shows which existing Patient fields are mapped to Welfare Approval.
+    """
+    meta = frappe.get_meta(PATIENT_DT)
+
+    matches = []
+
+    for df in meta.fields:
+        label = df.label or ""
+        fieldname = df.fieldname or ""
+        combined = (label + " " + fieldname).lower()
+
+        if "religion" in combined or "sanction" in combined or "nationality" in combined or "nation" in combined:
+            matches.append({
+                "fieldname": fieldname,
+                "label": label,
+                "fieldtype": df.fieldtype,
+                "options": df.options,
+            })
+
+    return {
+        "religion_field": _kpws_v84_religion_field(),
+        "sanction_field": _kpws_v84_sanction_field(),
+        "nationality_field": _kpws_v84_nationality_field(),
+        "matches": matches,
+    }
+
+
+# Override _patient_data to include Religion/Sanction/Nationality
+try:
+    _kpws_v84_old_patient_data = _patient_data
+except Exception:
+    _kpws_v84_old_patient_data = None
+
+
+def _patient_data(patient):
+    if not _kpws_v84_old_patient_data:
+        return {}
+
+    data = _kpws_v84_old_patient_data(patient)
+
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        return data
+
+    religion_field = _kpws_v84_religion_field()
+    sanction_field = _kpws_v84_sanction_field()
+    nationality_field = _kpws_v84_nationality_field()
+
+    if religion_field:
+        data["religion"] = frappe.db.get_value(PATIENT_DT, patient, religion_field) or ""
+        data["religion_fieldname"] = religion_field
+
+    if sanction_field:
+        data["sanction"] = frappe.db.get_value(PATIENT_DT, patient, sanction_field) or ""
+        data["sanction_fieldname"] = sanction_field
+
+    if nationality_field:
+        data["nationality"] = frappe.db.get_value(PATIENT_DT, patient, nationality_field) or ""
+        data["nationality_fieldname"] = nationality_field
+
+    return data
+
+
+def _kpws_v84_extra_patient_identity_updates(data):
+    updates = {}
+
+    religion_field = _kpws_v84_religion_field()
+    sanction_field = _kpws_v84_sanction_field()
+    nationality_field = _kpws_v84_nationality_field()
+
+    if religion_field and _has(PATIENT_DT, religion_field):
+        updates[religion_field] = data.get("religion") or ""
+
+    if sanction_field and _has(PATIENT_DT, sanction_field):
+        updates[sanction_field] = data.get("sanction") or ""
+
+    if nationality_field and _has(PATIENT_DT, nationality_field):
+        updates[nationality_field] = data.get("nationality") or ""
+
+    return updates
+
+
+# Final override for latest V83 save helper so these fields also save.
+def _kpws_v84_save_patient_from_request(patient, data):
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Linked Patient not found.")
+
+    p = frappe.get_doc(PATIENT_DT, patient)
+    old_customer = p.get("customer")
+
+    funding, percentage, panel_customer = _kpws_v83_normalize_welfare_decision(data)
+
+    relation_field = _relation_field()
+    old_kpws_field = _old_kpws_field()
+
+    updates = {}
+
+    def add(fieldname, value, allow_blank=True):
+        if fieldname and _has(PATIENT_DT, fieldname):
+            if value not in (None, "") or allow_blank:
+                updates[fieldname] = value or ""
+
+    add("first_name", data.get("first_name"), allow_blank=False)
+    add("last_name", data.get("last_name"))
+    add("age_", data.get("age"), allow_blank=False)
+    add("sex", data.get("sex"), allow_blank=False)
+    add("mobile", data.get("mobile"))
+    add("custom_kpws_mobile_no", data.get("mobile"))
+    add("custom_kpws_cnic", data.get("cnic"), allow_blank=False)
+    add("cnic_number", data.get("cnic"))
+    add("custom_reference_number", data.get("mr_number"))
+    add("patient_status", data.get("patient_status") or "SE")
+    add("patient_details", data.get("patient_details"))
+    for _key, fieldname, _label in ADDRESS_FIELDS:
+        add(fieldname, data.get(_key))
+    add(relation_field, data.get("relation_name"))
+    add(old_kpws_field, data.get("old_kpws_number"))
+
+    # New identity fields
+    updates.update(_kpws_v84_extra_patient_identity_updates(data))
+
+    # Keep patient Welfare and sync funding + optional panel.
+    add("customer_group", "Welfare")
+    add("custom_kpws_funding_source", funding)
+    add("custom_panel_customer", panel_customer)
+
+    if updates:
+        frappe.db.set_value(PATIENT_DT, patient, updates, update_modified=True)
+
+    # Never replace linked customer from approval panel.
+    if old_customer and _has(PATIENT_DT, "customer"):
+        frappe.db.set_value(PATIENT_DT, patient, "customer", old_customer, update_modified=False)
+
+
+@frappe.whitelist()
+def save_request(payload=None):
+    """
+    Final override V84:
+    Saves patient identity fields + Zakat/Donation optional panel.
+    """
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+
+    patient_field = _prf_patient_field()
+    patient = data.get("patient") or (prf.get(patient_field) if patient_field else None)
+
+    if not patient:
+        frappe.throw("Linked Patient not found on request.")
+
+    if prf.docstatus == 1 or prf.get("workflow_state") == "Approved":
+        next_state = "Approved"
+        action_note = "Approved request overridden"
+    else:
+        next_state = "Pending Approval"
+        action_note = "Pending request updated"
+
+    _kpws_v84_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state=next_state)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "{0} from KPWS Welfare Approval Panel by {1} at {2}".format(
+                action_note,
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+
+@frappe.whitelist()
+def approve_request(payload=None):
+    """
+    Final override V84:
+    Saves patient identity fields, optional panel, then approves.
+    """
+    from frappe.utils import now_datetime
+
+    _require_admin()
+
+    data = _parse_payload(payload)
+    name = data.get("name") or data.get("request")
+
+    if not name or not frappe.db.exists(PRF_DT, name):
+        frappe.throw("Request not found.")
+
+    prf = frappe.get_doc(PRF_DT, name)
+    patient = prf.get(_prf_patient_field())
+
+    _kpws_v84_save_patient_from_request(patient, data)
+    _kpws_v83_save_prf_any_status(name, data, workflow_state="Approved")
+
+    prf.reload()
+
+    if prf.docstatus != 1:
+        try:
+            prf.flags.ignore_permissions = True
+            prf.flags.ignore_workflow = True
+            frappe.flags.ignore_workflow = True
+            prf.submit()
+        except Exception:
+            if _has(PRF_DT, "workflow_state"):
+                frappe.db.set_value(PRF_DT, name, "workflow_state", "Approved", update_modified=False)
+
+    try:
+        frappe.get_doc(PRF_DT, name).add_comment(
+            "Info",
+            "Approved/overridden from KPWS Welfare Approval Panel by {0} at {1}".format(
+                frappe.session.user,
+                now_datetime(),
+            ),
+        )
+    except Exception:
+        pass
+
+    frappe.db.commit()
+    return get_request(name)
+
+# KPWS_CORE_PATIENT_EXTRA_FIELDS_WELFARE_V90
+_KPWS_V90_PATIENT_EXTRA_CANDIDATES = {
+    "religion": ["custom_religion", "religion"],
+    "sanction": ["custom_sanction", "custom_saction", "sanction", "saction"],
+    "nationality": ["custom_nationality", "nationality"],
+}
+
+_KPWS_V90_PRF_EXTRA_CANDIDATES = {
+    "religion": ["custom_religion", "religion1", "religion"],
+    "sanction": ["custom_sanction", "sanction", "saction1", "custom_saction", "custom_sect", "section"],
+    "nationality": ["custom_nationality", "nationality"],
+}
+
+
+def _kpws_v90_first_field(dt, candidates):
+    try:
+        meta = frappe.get_meta(dt)
+        for fieldname in candidates:
+            if fieldname and meta.has_field(fieldname):
+                return fieldname
+    except Exception:
+        pass
+    return None
+
+
+def _kpws_v90_pick_extra(data, key):
+    data = data or {}
+    aliases = {
+        "religion": ["custom_religion", "religion", "religion1"],
+        "sanction": ["custom_sanction", "sanction", "saction", "saction1", "custom_saction"],
+        "nationality": ["custom_nationality", "nationality"],
+    }.get(key, [key])
+
+    lower = {str(k).lower(): v for k, v in data.items()}
+    for alias in aliases:
+        if alias in data and data.get(alias) is not None:
+            return data.get(alias)
+        lk = alias.lower()
+        if lk in lower and lower.get(lk) is not None:
+            return lower.get(lk)
+    return None
+
+
+def _kpws_v90_doc_extra_values(dt, name, candidates_map):
+    out = {"religion": "", "sanction": "", "nationality": ""}
+    if not name or not frappe.db.exists(dt, name):
+        return out
+
+    for key, candidates in candidates_map.items():
+        for fieldname in candidates:
+            if _has(dt, fieldname):
+                try:
+                    value = frappe.db.get_value(dt, name, fieldname)
+                except Exception:
+                    value = None
+                if value:
+                    out[key] = value
+                    break
+    return out
+
+
+def _kpws_v90_set_extra_values(dt, name, data, candidates_map, update_modified=True):
+    if not name or not frappe.db.exists(dt, name):
+        return {}
+
+    updates = {}
+    for key, candidates in candidates_map.items():
+        fieldname = _kpws_v90_first_field(dt, candidates)
+        if not fieldname:
+            continue
+        value = _kpws_v90_pick_extra(data, key)
+        if value is not None:
+            updates[fieldname] = value or ""
+
+    if updates:
+        frappe.db.set_value(dt, name, updates, update_modified=update_modified)
+
+    return updates
+
+
+try:
+    _kpws_v90_old_patient_data = _patient_data
+except Exception:
+    _kpws_v90_old_patient_data = None
+
+
+def _patient_data(patient):
+    data = _kpws_v90_old_patient_data(patient) if _kpws_v90_old_patient_data else {}
+    if isinstance(data, dict) and patient:
+        data.update(_kpws_v90_doc_extra_values(PATIENT_DT, patient, _KPWS_V90_PATIENT_EXTRA_CANDIDATES))
+    return data
+
+
+try:
+    _kpws_v90_old_get_request = get_request
+except Exception:
+    _kpws_v90_old_get_request = None
+
+
+@frappe.whitelist()
+def get_request(name=None):
+    if not _kpws_v90_old_get_request:
+        frappe.throw("Base get_request is not available.")
+
+    result = _kpws_v90_old_get_request(name=name)
+    if isinstance(result, dict) and name:
+        prf_values = _kpws_v90_doc_extra_values(PRF_DT, name, _KPWS_V90_PRF_EXTRA_CANDIDATES)
+        patient_data = result.get("patient") or {}
+        if isinstance(patient_data, dict):
+            for key, value in prf_values.items():
+                if value and not patient_data.get(key):
+                    patient_data[key] = value
+            result["patient"] = patient_data
+    return result
+
+
+try:
+    _kpws_v90_old_v83_save_patient_from_request = _kpws_v83_save_patient_from_request
+except Exception:
+    _kpws_v90_old_v83_save_patient_from_request = None
+
+
+def _kpws_v83_save_patient_from_request(patient, data):
+    result = None
+    if _kpws_v90_old_v83_save_patient_from_request:
+        result = _kpws_v90_old_v83_save_patient_from_request(patient, data)
+    _kpws_v90_set_extra_values(PATIENT_DT, patient, data, _KPWS_V90_PATIENT_EXTRA_CANDIDATES, update_modified=True)
+    return result
+
+
+try:
+    _kpws_v90_old_v83_save_prf_any_status = _kpws_v83_save_prf_any_status
+except Exception:
+    _kpws_v90_old_v83_save_prf_any_status = None
+
+
+def _kpws_v83_save_prf_any_status(name, data, workflow_state=None):
+    result = None
+    if _kpws_v90_old_v83_save_prf_any_status:
+        result = _kpws_v90_old_v83_save_prf_any_status(name, data, workflow_state=workflow_state)
+    _kpws_v90_set_extra_values(PRF_DT, name, data, _KPWS_V90_PRF_EXTRA_CANDIDATES, update_modified=True)
+    return result
+
+
+# KPWS_AUDIT_PATCH_B_20260619: Welfare Approval patient/panel alias safety
+try:
+    _kpws_audit_old_prf_patient_field = _prf_patient_field
+except Exception:
+    _kpws_audit_old_prf_patient_field = None
+
+try:
+    _kpws_audit_old_save_prf_any_status = _kpws_v83_save_prf_any_status
+except Exception:
+    _kpws_audit_old_save_prf_any_status = None
+
+
+def _kpws_audit_prf_patient_fields():
+    try:
+        meta = frappe.get_meta(PRF_DT)
+    except Exception:
+        return []
+
+    fields = []
+    for candidate in ("custom_patient", "patient", "custom_kpws_source_patient", "patient_id", "custom_patient_id"):
+        if meta.has_field(candidate) and candidate not in fields:
+            fields.append(candidate)
+
+    for df in meta.fields:
+        if df.fieldtype == "Link" and df.options == PATIENT_DT and df.fieldname not in fields:
+            fields.append(df.fieldname)
+
+    return fields
+
+
+def _prf_patient_field():
+    fields = _kpws_audit_prf_patient_fields()
+    if fields:
+        return fields[0]
+    if _kpws_audit_old_prf_patient_field:
+        return _kpws_audit_old_prf_patient_field()
+    return "patient"
+
+
+def _kpws_audit_get_prf_patient(prf):
+    for fieldname in _kpws_audit_prf_patient_fields():
+        value = prf.get(fieldname)
+        if value and frappe.db.exists(PATIENT_DT, value):
+            return value
+    return None
+
+
+def _kpws_audit_set_prf_aliases(name, patient=None, panel_customer=None):
+    if not name or not frappe.db.exists(PRF_DT, name):
+        return {}
+
+    updates = {}
+    meta = frappe.get_meta(PRF_DT)
+
+    if patient and frappe.db.exists(PATIENT_DT, patient):
+        for fieldname in _kpws_audit_prf_patient_fields():
+            updates[fieldname] = patient
+
+    if panel_customer:
+        for fieldname in ("custom_panel_customer", "custom_kpws_assigned_panel_customer", "panel_customer"):
+            if meta.has_field(fieldname):
+                updates[fieldname] = panel_customer
+
+    if updates:
+        frappe.db.set_value(PRF_DT, name, updates, update_modified=False)
+
+    return updates
+
+
+def _kpws_v83_save_prf_any_status(name, data, workflow_state=None):
+    result = None
+    if _kpws_audit_old_save_prf_any_status:
+        result = _kpws_audit_old_save_prf_any_status(name, data, workflow_state=workflow_state)
+
+    try:
+        prf = frappe.get_doc(PRF_DT, name)
+        patient = data.get("patient") or data.get("custom_patient") or _kpws_audit_get_prf_patient(prf)
+        panel_customer = data.get("panel_customer") or data.get("custom_panel_customer") or prf.get("custom_panel_customer") or prf.get("custom_kpws_assigned_panel_customer")
+        _kpws_audit_set_prf_aliases(name, patient=patient, panel_customer=panel_customer)
+
+        # KPWS_AUDIT_PATCH_D_20260620: final active PRF wrapper address sync.
+        address_values = {key: data.get(key) or "" for key, _fieldname, _label in ADDRESS_FIELDS}
+        updates = {}
+        for key, fieldname, _label in ADDRESS_FIELDS:
+            if _has(PRF_DT, fieldname):
+                updates[fieldname] = address_values.get(key) or ""
+        if _has(PRF_DT, "address"):
+            updates["address"] = _address_text(address_values)
+        if updates:
+            frappe.db.set_value(PRF_DT, name, updates, update_modified=True)
+    except Exception:
+        frappe.log_error(frappe.get_traceback(), "KPWS Audit Patch B/D Welfare PRF alias/address sync failed")
+
+    return result
+

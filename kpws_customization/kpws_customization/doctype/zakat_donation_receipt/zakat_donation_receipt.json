@@ -1,0 +1,218 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "naming_series:",
+ "creation": "2025-11-12 12:35:38.875218",
+ "default_view": "List",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "naming_series",
+  "receipt_type",
+  "receipt_date",
+  "received_from",
+  "received_for",
+  "care_of_table",
+  "on_account_of",
+  "mode_of_payment",
+  "payment_account",
+  "currency",
+  "enter_amount_in_pkr",
+  "foreign_amount",
+  "rate",
+  "amount_in_pkr",
+  "drawn_on",
+  "voucher_reference",
+  "purpose",
+  "company",
+  "journal_entry",
+  "donor_mobile",
+  "donor_address",
+  "mode_details",
+  "bank_info",
+  "amended_from"
+ ],
+ "fields": [
+  {
+   "fieldname": "naming_series",
+   "fieldtype": "Select",
+   "label": "Series",
+   "options": "ZDR-.YYYY.-",
+   "reqd": 1
+  },
+  {
+   "fieldname": "receipt_type",
+   "fieldtype": "Select",
+   "in_list_view": 1,
+   "label": "Receipt Type",
+   "options": "Official",
+   "reqd": 1
+  },
+  {
+   "fieldname": "receipt_date",
+   "fieldtype": "Date",
+   "in_list_view": 1,
+   "label": "Receipt Date",
+   "reqd": 1
+  },
+  {
+   "fieldname": "received_from",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Received From (Donor)",
+   "options": "Donor",
+   "reqd": 1
+  },
+  {
+   "fieldname": "received_for",
+   "fieldtype": "Link",
+   "label": "Received For (Patient)",
+   "options": "Patient"
+  },
+  {
+   "fieldname": "care_of_table",
+   "fieldtype": "Table",
+   "label": "Care Of",
+   "options": "Care Of"
+  },
+  {
+   "fieldname": "on_account_of",
+   "fieldtype": "Select",
+   "label": "On Account Of",
+   "options": "Zakat\nDonation",
+   "reqd": 1
+  },
+  {
+   "fieldname": "mode_of_payment",
+   "fieldtype": "Select",
+   "label": "Mode of Payment",
+   "options": "Cash\nOnline\nPay Order\nBank",
+   "reqd": 1
+  },
+  {
+   "fieldname": "payment_account",
+   "fieldtype": "Link",
+   "label": "Payment Account",
+   "options": "Account",
+   "reqd": 1
+  },
+  {
+   "fieldname": "currency",
+   "fieldtype": "Link",
+   "label": "Currency",
+   "options": "Currency",
+   "reqd": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "enter_amount_in_pkr",
+   "fieldtype": "Check",
+   "label": "Enter Amount in PKR?"
+  },
+  {
+   "fieldname": "foreign_amount",
+   "fieldtype": "Float",
+   "label": "Amount (Foreign)",
+   "options": "Precision 2"
+  },
+  {
+   "fieldname": "rate",
+   "fieldtype": "Float",
+   "label": "Rate (PKR per Unit)",
+   "options": "Precision 6"
+  },
+  {
+   "fieldname": "amount_in_pkr",
+   "fieldtype": "Currency",
+   "label": "Amount (PKR)",
+   "options": "PKR",
+   "reqd": 1
+  },
+  {
+   "fieldname": "drawn_on",
+   "fieldtype": "Data",
+   "label": "Drawn On"
+  },
+  {
+   "fieldname": "voucher_reference",
+   "fieldtype": "Data",
+   "label": "Voucher Reference"
+  },
+  {
+   "fieldname": "purpose",
+   "fieldtype": "Small Text",
+   "label": "Purpose / Remarks",
+   "reqd": 1
+  },
+  {
+   "fieldname": "company",
+   "fieldtype": "Link",
+   "label": "Company",
+   "options": "Company"
+  },
+  {
+   "fieldname": "journal_entry",
+   "fieldtype": "Link",
+   "label": "Journal Entry",
+   "options": "Journal Entry"
+  },
+  {
+   "fieldname": "donor_mobile",
+   "fieldtype": "Data",
+   "label": "Donor Cell No"
+  },
+  {
+   "fieldname": "donor_address",
+   "fieldtype": "Small Text",
+   "label": "Address"
+  },
+  {
+   "fieldname": "mode_details",
+   "fieldtype": "Section Break",
+   "label": "Mode Details"
+  },
+  {
+   "fieldname": "bank_info",
+   "fieldtype": "Column Break",
+   "label": "Bank Info"
+  },
+  {
+   "fieldname": "amended_from",
+   "fieldtype": "Link",
+   "label": "Amended From",
+   "no_copy": 1,
+   "options": "Zakat Donation Receipt",
+   "print_hide": 1,
+   "read_only": 1,
+   "search_index": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "is_submittable": 1,
+ "links": [],
+ "modified": "2025-11-12 16:01:47.956449",
+ "modified_by": "Administrator",
+ "module": "Kpws Customization",
+ "name": "Zakat Donation Receipt",
+ "naming_rule": "By \"Naming Series\" field",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "create": 1,
+   "delete": 1,
+   "email": 1,
+   "export": 1,
+   "print": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager",
+   "share": 1,
+   "write": 1
+  }
+ ],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": [],
+ "track_changes": 1
+}

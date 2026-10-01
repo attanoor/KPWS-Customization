@@ -1,0 +1,1150 @@
+# -*- coding: utf-8 -*-
+"""
+KPWS Patient Intake Desk v52
+Single screen intake + welfare approval + panel/advance context.
+Designed for ERPNext/Frappe v14 and KPWS custom Patient Registration Form.
+"""
+import re
+import frappe
+from frappe import _
+from frappe.utils import flt, cint, nowdate, nowtime
+
+PATIENT_DT = "Patient"
+PRF_DT = "Patient Registration Form"
+COMPANY = "Kiran Patient Welfare Society"
+
+PATIENT_TYPES = ["Cash", "Welfare", "Panel", "Personal Advance"]
+FUNDING_SOURCES = ["Self Paid", "Zakat", "Donation", "Panel", "Personal Advance"]
+
+
+def _has_doctype(dt):
+    return bool(frappe.db.exists("DocType", dt))
+
+
+def _meta(dt):
+    return frappe.get_meta(dt)
+
+
+def _has_field(dt, fieldname):
+    return _has_doctype(dt) and _meta(dt).has_field(fieldname)
+
+
+def _first_existing_field(dt, candidates):
+    if not _has_doctype(dt):
+        return None
+    meta = _meta(dt)
+    for f in candidates:
+        if meta.has_field(f):
+            return f
+    return None
+
+
+def _set_if_has(doc, fieldname, value):
+    if doc.meta.has_field(fieldname):
+        doc.set(fieldname, value)
+
+
+def normalize_cnic(value):
+    return re.sub(r"\D", "", value or "")
+
+
+def format_cnic(value):
+    digits = normalize_cnic(value)
+    if len(digits) == 13:
+        return f"{digits[:5]}-{digits[5:12]}-{digits[12]}"
+    return value or ""
+
+
+def patient_cnic_field():
+    return _first_existing_field(PATIENT_DT, [
+        "custom_kpws_cnic",
+        "cnic",
+        "custom_cnic",
+        "custom_cnic_number",
+        "cnic_number",
+        "custom_id_card_number",
+    ])
+
+
+def patient_mobile_field():
+    return _first_existing_field(PATIENT_DT, [
+        "mobile", "mobile_no", "phone", "custom_mobile", "custom_mobile_no", "custom_phone_number"
+    ])
+
+
+def patient_relation_field():
+    return _first_existing_field(PATIENT_DT, [
+        "custom_relation_name", "relation_name", "custom_guardian_name", "guardian_name", "custom_father_husband_name"
+    ])
+
+
+def patient_old_kpws_field():
+    return _first_existing_field(PATIENT_DT, ["custom_old_kpws_number", "old_kpws_number", "custom_old_mr_number"])
+
+
+def _options_text(options):
+    if isinstance(options, (list, tuple)):
+        return "\n".join([str(x) for x in options])
+    return options or ""
+
+
+def _ensure_custom_field(dt, fieldname, label, fieldtype, insert_after=None, options=None, reqd=0, read_only=0, hidden=0, depends_on=None, unique=0, description=None, allow_on_submit=0):
+    if _has_field(dt, fieldname):
+        cf_name = frappe.db.get_value("Custom Field", {"dt": dt, "fieldname": fieldname}, "name")
+        if cf_name:
+            updates = {}
+            if options is not None:
+                updates["options"] = _options_text(options)
+            updates.update({
+                "label": label,
+                "fieldtype": fieldtype,
+                "reqd": reqd,
+                "read_only": read_only,
+                "hidden": hidden,
+                "allow_on_submit": allow_on_submit,
+            })
+            if depends_on is not None:
+                updates["depends_on"] = depends_on
+            if description is not None:
+                updates["description"] = description
+            for k, v in updates.items():
+                frappe.db.set_value("Custom Field", cf_name, k, v, update_modified=False)
+        return
+
+    cf = frappe.new_doc("Custom Field")
+    cf.dt = dt
+    cf.fieldname = fieldname
+    cf.label = label
+    cf.fieldtype = fieldtype
+    cf.insert_after = insert_after
+    cf.options = _options_text(options)
+    cf.reqd = reqd
+    cf.read_only = read_only
+    cf.hidden = hidden
+    cf.depends_on = depends_on
+    cf.unique = unique
+    cf.description = description
+    cf.allow_on_submit = allow_on_submit
+    cf.insert(ignore_permissions=True)
+
+
+def _ensure_select_options(dt, fieldname, required_options):
+    if not _has_field(dt, fieldname):
+        return
+    meta = _meta(dt)
+    df = meta.get_field(fieldname)
+    current = []
+    for line in (df.options or "").split("\n"):
+        line = line.strip()
+        if line:
+            current.append(line)
+    for opt in required_options:
+        if opt not in current:
+            current.append(opt)
+    opts = "\n".join(current)
+    cf_name = frappe.db.get_value("Custom Field", {"dt": dt, "fieldname": fieldname}, "name")
+    if cf_name:
+        frappe.db.set_value("Custom Field", cf_name, "options", opts, update_modified=False)
+    else:
+        # standard DocField update via Property Setter
+        ps_name = frappe.db.get_value("Property Setter", {
+            "doc_type": dt,
+            "field_name": fieldname,
+            "property": "options",
+            "property_type": "Text",
+        }, "name")
+        if ps_name:
+            frappe.db.set_value("Property Setter", ps_name, "value", opts, update_modified=False)
+        else:
+            ps = frappe.new_doc("Property Setter")
+            ps.doctype_or_field = "DocField"
+            ps.doc_type = dt
+            ps.field_name = fieldname
+            ps.property = "options"
+            ps.property_type = "Text"
+            ps.value = opts
+            ps.insert(ignore_permissions=True)
+
+
+def _safe_customer_group(name):
+    if not name:
+        return None
+    if frappe.db.exists("Customer Group", name):
+        return name
+    if frappe.db.exists("Customer", name):
+        print("Skipping Customer Group due Customer name conflict:", name)
+        return None
+    parent = None
+    for p in ("All Customer Groups", "All Customer Group"):
+        if frappe.db.exists("Customer Group", p):
+            parent = p
+            break
+    try:
+        doc = frappe.new_doc("Customer Group")
+        doc.customer_group_name = name
+        doc.is_group = 0
+        if parent:
+            doc.parent_customer_group = parent
+        doc.insert(ignore_permissions=True)
+        return doc.name
+    except Exception as e:
+        if "same name" in str(e).lower():
+            print("Skipping Customer Group due name conflict:", name)
+            return None
+        raise
+
+
+@frappe.whitelist()
+def install():
+    """Install/update fields and page record."""
+    frappe.only_for(("System Manager",))
+    setup_fields()
+    ensure_page()
+    frappe.clear_cache()
+    frappe.db.commit()
+    return {"ok": True, "message": "KPWS Patient Intake Desk v52 installed"}
+
+
+def setup_fields():
+    # Customer groups are optional but useful. Skip on conflict.
+    for name in PATIENT_TYPES:
+        _safe_customer_group(name)
+
+    # Patient fields. Do not duplicate existing cnic/mobile fields if present.
+    if not patient_cnic_field():
+        _ensure_custom_field(
+            PATIENT_DT,
+            "custom_kpws_cnic",
+            "CNIC",
+            "Data",
+            insert_after="custom_reference_number" if _has_field(PATIENT_DT, "custom_reference_number") else None,
+            reqd=0,
+            description="Mandatory CNIC. System normalizes this for duplicate checking.",
+        )
+    if not patient_mobile_field():
+        _ensure_custom_field(PATIENT_DT, "custom_kpws_mobile_no", "Mobile", "Data", insert_after=patient_cnic_field())
+
+    _ensure_custom_field(
+        PATIENT_DT,
+        "custom_kpws_funding_source",
+        "Funding Source",
+        "Select",
+        insert_after="customer_group" if _has_field(PATIENT_DT, "customer_group") else None,
+        options=["", *FUNDING_SOURCES],
+        depends_on="eval:(doc.customer_group || '').toLowerCase().includes('welfare') || (doc.customer_group || '').toLowerCase().includes('advance')",
+    )
+    _ensure_custom_field(PATIENT_DT, "custom_kpws_active_prf", "Active Welfare Registration", "Link", insert_after="custom_kpws_funding_source", options=PRF_DT, read_only=1)
+    _ensure_custom_field(PATIENT_DT, "custom_kpws_approval_status", "Approval Status", "Select", insert_after="custom_kpws_active_prf", options=["Not Required", "Draft", "Pending Approval", "Approved", "Rejected"], read_only=1)
+    _ensure_custom_field(PATIENT_DT, "custom_kpws_intake_notes", "Intake Notes", "Small Text", insert_after="patient_details" if _has_field(PATIENT_DT, "patient_details") else None)
+    _ensure_custom_field(PATIENT_DT, "custom_kpws_advance_balance_html", "Advance Balance", "HTML", insert_after="custom_kpws_intake_notes")
+
+    if _has_doctype("Customer"):
+        _ensure_custom_field("Customer", "custom_is_panel", "Is Panel", "Check", insert_after="customer_group")
+        _ensure_custom_field("Customer", "custom_kpws_is_advance_customer", "Is Advance Customer", "Check", insert_after="custom_is_panel")
+        _ensure_custom_field("Customer", "custom_kpws_advance_type", "Advance Type", "Select", insert_after="custom_kpws_is_advance_customer", options=["", "Personal Advance", "Panel Advance"])
+
+    if _has_doctype(PRF_DT):
+        _ensure_select_options(PRF_DT, "purpose", ["Zakat", "Donation", "Panel"])
+        _ensure_select_options(PRF_DT, "custom_kpws_welfare_type", ["Zakat", "Donation", "Panel"])
+        _ensure_custom_field(PRF_DT, "custom_kpws_funding_source", "Funding Source", "Select", insert_after="custom_kpws_welfare_type" if _has_field(PRF_DT, "custom_kpws_welfare_type") else None, options=["", "Zakat", "Donation", "Panel"])
+        # Existing PRF already has custom_panel_customer, but ensure if missing.
+        if not _has_field(PRF_DT, "custom_panel_customer"):
+            _ensure_custom_field(PRF_DT, "custom_panel_customer", "Panel", "Link", insert_after="custom_kpws_funding_source", options="Customer")
+        # hidden sync marker
+        _ensure_custom_field(PRF_DT, "custom_kpws_source_patient", "Source Patient", "Link", insert_after="custom_panel_customer", options="Patient", hidden=1)
+
+    # Sales Invoice fields used by downstream billing policy.
+    if _has_doctype("Sales Invoice"):
+        _ensure_custom_field("Sales Invoice", "custom_kpws_patient_billing_group", "KPWS Patient Billing Group", "Data", insert_after="customer", read_only=1, allow_on_submit=1)
+        _ensure_custom_field("Sales Invoice", "custom_kpws_purpose", "KPWS Welfare Purpose", "Data", insert_after="custom_kpws_patient_billing_group", read_only=1, allow_on_submit=1)
+        _ensure_custom_field("Sales Invoice", "custom_kpws_approved_percentage", "KPWS Approved Percentage", "Percent", insert_after="custom_kpws_purpose", read_only=1, allow_on_submit=1)
+        _ensure_custom_field("Sales Invoice", "custom_kpws_advance_used_amount", "KPWS Advance Used Amount", "Currency", insert_after="custom_kpws_approved_percentage", read_only=1, allow_on_submit=1)
+
+    for dt in [PATIENT_DT, PRF_DT, "Customer", "Sales Invoice"]:
+        if _has_doctype(dt):
+            frappe.clear_cache(doctype=dt)
+            try:
+                frappe.db.updatedb(dt)
+            except Exception:
+                pass
+
+
+def ensure_page():
+    page_name = "kpws-patient-intake"
+    if frappe.db.exists("Page", page_name):
+        page = frappe.get_doc("Page", page_name)
+    else:
+        page = frappe.new_doc("Page")
+        page.page_name = page_name
+    page.title = "KPWS Patient Intake"
+    page.module = "Kpws Customization"
+    page.standard = "Yes"
+    page.system_page = 0
+    page.roles = []
+    for role in ["System Manager", "Administrator", "Receptionist", "Healthcare User", "Accounts User"]:
+        if frappe.db.exists("Role", role):
+            page.append("roles", {"role": role})
+    page.flags.ignore_permissions = True
+    page.save(ignore_permissions=True)
+
+
+def _get_patient_value(patient, field):
+    if not field:
+        return None
+    return frappe.db.get_value(PATIENT_DT, patient, field)
+
+
+def _patient_customer(patient):
+    return _get_patient_value(patient, "customer") if _has_field(PATIENT_DT, "customer") else None
+
+
+def _patient_type(patient):
+    return _get_patient_value(patient, "customer_group") if _has_field(PATIENT_DT, "customer_group") else None
+
+
+def _patient_panel(patient):
+    return _get_patient_value(patient, "custom_panel_customer") if _has_field(PATIENT_DT, "custom_panel_customer") else None
+
+
+def _patient_funding_source(patient):
+    return _get_patient_value(patient, "custom_kpws_funding_source") if _has_field(PATIENT_DT, "custom_kpws_funding_source") else None
+
+
+def _latest_prf(patient):
+    if not _has_doctype(PRF_DT):
+        return None
+    if not _has_field(PRF_DT, "custom_patient"):
+        return None
+    rows = frappe.get_all(PRF_DT, filters={"custom_patient": patient}, fields=["name", "docstatus", "workflow_state", "modified"], order_by="modified desc", limit=1)
+    return rows[0] if rows else None
+
+
+def _latest_approved_prf(patient):
+    if not _has_doctype(PRF_DT) or not _has_field(PRF_DT, "custom_patient"):
+        return None
+    filters = {"custom_patient": patient, "docstatus": 1}
+    rows = frappe.get_all(PRF_DT, filters=filters, fields=["name", "docstatus", "workflow_state", "modified"], order_by="modified desc", limit=1)
+    return frappe.get_doc(PRF_DT, rows[0].name) if rows else None
+
+
+def _prf_context(patient):
+    prf = _latest_approved_prf(patient)
+    if not prf:
+        latest = _latest_prf(patient)
+        return {"exists": bool(latest), "name": latest.name if latest else None, "approved": False, "status": latest.workflow_state if latest else None}
+    purpose = prf.get("custom_kpws_funding_source") or prf.get("custom_kpws_welfare_type") or prf.get("purpose")
+    percentage = prf.get("custom_kpws_welfare_percentage") or prf.get("discount_value") or 0
+    panel_customer = prf.get("custom_panel_customer") or prf.get("custom_kpws_assigned_panel_customer")
+    return {
+        "exists": True,
+        "approved": True,
+        "name": prf.name,
+        "status": prf.get("workflow_state") or "Approved",
+        "purpose": purpose,
+        "percentage": flt(percentage),
+        "panel_customer": panel_customer,
+    }
+
+
+def _customer_is_advance(customer):
+    if not customer or not frappe.db.exists("Customer", customer):
+        return False
+    if _has_field("Customer", "custom_kpws_is_advance_customer"):
+        return cint(frappe.db.get_value("Customer", customer, "custom_kpws_is_advance_customer")) == 1
+    return False
+
+
+def get_customer_advance_balance(customer):
+    if not customer:
+        return 0
+    try:
+        from erpnext.accounts.doctype.payment_entry.payment_entry import get_party_details
+    except Exception:
+        pass
+    # Use unallocated submitted Payment Entries for this customer.
+    rows = frappe.db.sql("""
+        SELECT SUM(unallocated_amount) AS bal
+        FROM `tabPayment Entry`
+        WHERE docstatus = 1
+          AND party_type = 'Customer'
+          AND party = %s
+          AND payment_type = 'Receive'
+    """, (customer,), as_dict=True)
+    return flt(rows[0].bal if rows else 0, 2)
+
+
+def billing_decision_for_patient(patient):
+    ptype = (_patient_type(patient) or "Cash").strip()
+    ptype_l = ptype.lower()
+    patient_customer = _patient_customer(patient)
+    patient_panel = _patient_panel(patient)
+    funding = (_patient_funding_source(patient) or "").strip()
+    prf = _prf_context(patient)
+    if prf.get("approved") and prf.get("purpose"):
+        funding = prf.get("purpose")
+    panel_customer = prf.get("panel_customer") or patient_panel
+
+    decision = {
+        "patient_type": ptype,
+        "funding_source": funding or "Self Paid",
+        "billing_type": "Cash",
+        "bill_to_customer": patient_customer,
+        "panel_customer": panel_customer,
+        "requires_approval": False,
+        "approval_status": prf.get("status") or "Not Required",
+        "approved_percentage": flt(prf.get("percentage") or 0),
+        "prf": prf.get("name"),
+        "invoice_mode": "POS",
+        "settlement": "Cash / Card",
+        "can_bill": True,
+        "warnings": [],
+    }
+
+    funding_l = (funding or "").lower()
+
+    if ptype_l == "welfare" or funding_l in ["zakat", "donation", "panel"]:
+        decision["requires_approval"] = True
+        if not prf.get("approved"):
+            decision.update({"can_bill": False, "billing_type": "Welfare Pending", "invoice_mode": "Blocked"})
+            decision["warnings"].append("Approved Patient Registration Form is required for Welfare billing.")
+            return decision
+        if funding_l == "panel":
+            decision.update({
+                "billing_type": "Welfare Panel",
+                "bill_to_customer": panel_customer,
+                "invoice_mode": "Non-POS",
+                "settlement": "Panel Receivable",
+            })
+            if not panel_customer:
+                decision["can_bill"] = False
+                decision["warnings"].append("Panel customer is required for Welfare Panel.")
+        elif funding_l == "donation":
+            decision.update({"billing_type": "Welfare Donation", "invoice_mode": "Non-POS", "settlement": "Donation JV + patient share Cash/Card"})
+        else:
+            decision.update({"billing_type": "Welfare Zakat", "invoice_mode": "Non-POS", "settlement": "Zakat JV + patient share Cash/Card"})
+
+    elif ptype_l == "panel" or patient_panel:
+        decision.update({
+            "billing_type": "Panel",
+            "bill_to_customer": patient_panel or patient_customer,
+            "panel_customer": patient_panel,
+            "invoice_mode": "Non-POS",
+            "settlement": "Panel Receivable",
+        })
+        if not decision["bill_to_customer"]:
+            decision["can_bill"] = False
+            decision["warnings"].append("Panel customer is required.")
+
+    elif ptype_l == "personal advance" or funding_l == "personal advance" or _customer_is_advance(patient_customer):
+        adv = get_customer_advance_balance(patient_customer)
+        decision.update({
+            "billing_type": "Personal Advance",
+            "invoice_mode": "Non-POS",
+            "settlement": "Advance Allocation + remaining Cash/Card",
+            "advance_balance": adv,
+        })
+        if not patient_customer:
+            decision["can_bill"] = False
+            decision["warnings"].append("Linked customer is required for Personal Advance.")
+
+    return decision
+
+
+def _serialize_patient(patient):
+    doc = frappe.get_doc(PATIENT_DT, patient)
+    cnic_field = patient_cnic_field()
+    mobile_field = patient_mobile_field()
+    relation_field = patient_relation_field()
+    old_field = patient_old_kpws_field()
+    data = {
+        "name": doc.name,
+        "patient_name": doc.get("patient_name"),
+        "first_name": doc.get("first_name"),
+        "last_name": doc.get("last_name"),
+        "status": doc.get("status"),
+        "patient_status": doc.get("patient_status"),
+        "custom_reference_number": doc.get("custom_reference_number"),
+        "customer_group": doc.get("customer_group"),
+        "customer": doc.get("customer"),
+        "custom_panel_customer": doc.get("custom_panel_customer"),
+        "custom_kpws_funding_source": doc.get("custom_kpws_funding_source"),
+        "gender": doc.get("sex") or doc.get("gender"),
+        "age": doc.get("age"),
+        "dob": doc.get("dob"),
+        "patient_details": doc.get("patient_details"),
+        "custom_kpws_intake_notes": doc.get("custom_kpws_intake_notes"),
+        "cnic": doc.get(cnic_field) if cnic_field else None,
+        "mobile": doc.get(mobile_field) if mobile_field else None,
+        "relation_name": doc.get(relation_field) if relation_field else None,
+        "old_kpws_number": doc.get(old_field) if old_field else None,
+    }
+    data["billing_decision"] = billing_decision_for_patient(patient)
+    data["advance_balance"] = get_customer_advance_balance(data.get("customer"))
+    return data
+
+
+@frappe.whitelist()
+def search_patients(query=None, limit=20):
+    query = (query or "").strip()
+    limit = cint(limit or 20)
+    if not query:
+        return []
+
+    cnic_digits = normalize_cnic(query)
+    conditions = []
+    values = {}
+
+    search_fields = ["name", "patient_name", "custom_reference_number"]
+    for f in [patient_cnic_field(), patient_mobile_field(), patient_old_kpws_field()]:
+        if f and f not in search_fields:
+            search_fields.append(f)
+
+    for idx, f in enumerate(search_fields):
+        if not _has_field(PATIENT_DT, f) and f not in ["name"]:
+            continue
+        key = f"q{idx}"
+        if f == patient_cnic_field() and cnic_digits:
+            conditions.append(f"REPLACE(REPLACE(`{f}`, '-', ''), ' ', '') LIKE %({key})s")
+            values[key] = f"%{cnic_digits}%"
+        else:
+            conditions.append(f"`{f}` LIKE %({key})s")
+            values[key] = f"%{query}%"
+
+    if not conditions:
+        return []
+    values["limit"] = limit
+    rows = frappe.db.sql(f"""
+        SELECT name, patient_name, custom_reference_number, customer_group, custom_panel_customer, customer
+        FROM `tabPatient`
+        WHERE {' OR '.join(conditions)}
+        ORDER BY modified DESC
+        LIMIT %(limit)s
+    """, values, as_dict=True)
+    return rows
+
+
+@frappe.whitelist()
+def get_patient(patient):
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Patient not found")
+    return _serialize_patient(patient)
+
+
+def _find_duplicate_cnic(cnic, exclude=None):
+    field = patient_cnic_field()
+    if not field:
+        return None
+    digits = normalize_cnic(cnic)
+    if not digits:
+        return None
+    rows = frappe.db.sql(f"""
+        SELECT name, patient_name, custom_reference_number
+        FROM `tabPatient`
+        WHERE REPLACE(REPLACE(`{field}`, '-', ''), ' ', '') = %s
+          {"AND name != %s" if exclude else ""}
+        LIMIT 1
+    """, (digits, exclude) if exclude else (digits,), as_dict=True)
+    return rows[0] if rows else None
+
+
+def _ensure_customer_for_patient(patient_doc):
+    # Respect existing Healthcare/customer creation. If missing, create simple Customer.
+    if not patient_doc.meta.has_field("customer"):
+        return None
+    if patient_doc.get("customer") and frappe.db.exists("Customer", patient_doc.get("customer")):
+        return patient_doc.get("customer")
+    customer_name = patient_doc.get("patient_name") or " ".join(filter(None, [patient_doc.get("first_name"), patient_doc.get("last_name")])) or patient_doc.name
+    if frappe.db.exists("Customer", customer_name):
+        patient_doc.customer = customer_name
+        return customer_name
+    cust = frappe.new_doc("Customer")
+    cust.customer_name = customer_name
+    cust.customer_type = "Individual"
+    cust.customer_group = patient_doc.get("customer_group") or "Cash"
+    cust.insert(ignore_permissions=True)
+    patient_doc.customer = cust.name
+    return cust.name
+
+
+@frappe.whitelist()
+def save_patient(payload):
+    data = frappe.parse_json(payload) if isinstance(payload, str) else frappe._dict(payload or {})
+    patient = data.get("patient")
+    cnic = data.get("cnic")
+    cnic_digits = normalize_cnic(cnic)
+    if not cnic_digits:
+        frappe.throw("CNIC is mandatory.")
+    if len(cnic_digits) != 13:
+        frappe.throw("CNIC must be 13 digits.")
+
+    duplicate = _find_duplicate_cnic(cnic, exclude=patient)
+    if duplicate:
+        frappe.throw(f"Duplicate CNIC found on Patient {duplicate.name} - {duplicate.patient_name or ''}. Open existing patient instead.")
+
+    if patient and frappe.db.exists(PATIENT_DT, patient):
+        doc = frappe.get_doc(PATIENT_DT, patient)
+    else:
+        doc = frappe.new_doc(PATIENT_DT)
+        if doc.meta.has_field("naming_series"):
+            doc.naming_series = data.get("naming_series") or "KPWS-.####"
+
+    # Identity
+    _set_if_has(doc, "first_name", data.get("first_name"))
+    _set_if_has(doc, "last_name", data.get("last_name"))
+    if doc.meta.has_field("patient_name") and data.get("patient_name"):
+        doc.patient_name = data.get("patient_name")
+    _set_if_has(doc, "custom_reference_number", data.get("mr_number"))
+    old_field = patient_old_kpws_field()
+    if old_field:
+        _set_if_has(doc, old_field, data.get("old_kpws_number"))
+    _set_if_has(doc, "patient_status", data.get("patient_status") or "SE")
+    _set_if_has(doc, "status", data.get("status") or "Active")
+    _set_if_has(doc, "age", data.get("age"))
+    if doc.meta.has_field("sex"):
+        doc.sex = data.get("gender")
+    elif doc.meta.has_field("gender"):
+        doc.gender = data.get("gender")
+    relation_field = patient_relation_field()
+    if relation_field:
+        _set_if_has(doc, relation_field, data.get("relation_name"))
+    cnic_field = patient_cnic_field()
+    if cnic_field:
+        _set_if_has(doc, cnic_field, format_cnic(cnic))
+    mobile_field = patient_mobile_field()
+    if mobile_field:
+        _set_if_has(doc, mobile_field, data.get("mobile"))
+
+    # Classification
+    ptype = data.get("patient_type") or "Cash"
+    if ptype not in PATIENT_TYPES:
+        frappe.throw("Invalid Patient Type")
+    _set_if_has(doc, "customer_group", ptype)
+    funding_source = data.get("funding_source") or ("Self Paid" if ptype == "Cash" else "")
+    _set_if_has(doc, "custom_kpws_funding_source", funding_source)
+    _set_if_has(doc, "custom_panel_customer", data.get("panel_customer"))
+    _set_if_has(doc, "patient_details", data.get("patient_details"))
+    _set_if_has(doc, "custom_kpws_intake_notes", data.get("notes"))
+
+    if ptype == "Panel" and not data.get("panel_customer"):
+        frappe.throw("Panel Customer is required for Panel patients.")
+    if ptype == "Welfare" and funding_source not in ["Zakat", "Donation", "Panel"]:
+        frappe.throw("Funding Source is required for Welfare patients.")
+    if ptype == "Welfare" and funding_source == "Panel" and not data.get("panel_customer"):
+        frappe.throw("Panel Customer is required when Welfare Funding Source is Panel.")
+
+    doc.save(ignore_permissions=True)
+    _ensure_customer_for_patient(doc)
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+    return _serialize_patient(doc.name)
+
+
+@frappe.whitelist()
+def get_panel_customers(txt=None, limit=50):
+    txt = (txt or "").strip()
+    filters = []
+    values = {"limit": cint(limit or 50)}
+    where = "1=1"
+    if _has_field("Customer", "custom_is_panel"):
+        where += " AND custom_is_panel = 1"
+    else:
+        where += " AND customer_group = 'Panel'"
+    if txt:
+        where += " AND (name LIKE %(txt)s OR customer_name LIKE %(txt)s)"
+        values["txt"] = f"%{txt}%"
+    return frappe.db.sql(f"""
+        SELECT name, customer_name, customer_group
+        FROM `tabCustomer`
+        WHERE {where}
+        ORDER BY customer_name ASC
+        LIMIT %(limit)s
+    """, values, as_dict=True)
+
+
+@frappe.whitelist()
+def create_or_update_registration(patient, purpose=None, percentage=None, panel_customer=None, submit=0):
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Patient is required")
+    if not _has_doctype(PRF_DT):
+        frappe.throw("Patient Registration Form doctype not found")
+    p = frappe.get_doc(PATIENT_DT, patient)
+    funding = purpose or p.get("custom_kpws_funding_source") or "Zakat"
+    if funding not in ["Zakat", "Donation", "Panel"]:
+        funding = "Zakat"
+    percentage = flt(percentage if percentage is not None else 100)
+    panel_customer = panel_customer or p.get("custom_panel_customer")
+    if funding == "Panel" and not panel_customer:
+        frappe.throw("Panel Customer is required for Welfare Panel approval")
+    if funding in ["Zakat", "Donation"] and percentage <= 0:
+        frappe.throw("Percentage is required for Zakat/Donation approval")
+
+    # Reuse latest draft if available; otherwise create new.
+    rows = frappe.get_all(PRF_DT, filters={"custom_patient": patient, "docstatus": 0} if _has_field(PRF_DT, "custom_patient") else {}, fields=["name"], order_by="modified desc", limit=1)
+    if rows:
+        prf = frappe.get_doc(PRF_DT, rows[0].name)
+    else:
+        prf = frappe.new_doc(PRF_DT)
+
+    _set_if_has(prf, "custom_patient", patient)
+    _set_if_has(prf, "custom_kpws_source_patient", patient)
+    _set_if_has(prf, "custom_mr_number", p.get("custom_reference_number"))
+    _set_if_has(prf, "custom_patient_name", p.get("patient_name"))
+    _set_if_has(prf, "custom_patient_customer", p.get("customer"))
+    _set_if_has(prf, "custom_billing_type", p.get("customer_group"))
+    _set_if_has(prf, "purpose", funding)
+    _set_if_has(prf, "custom_kpws_welfare_type", funding)
+    _set_if_has(prf, "custom_kpws_funding_source", funding)
+    _set_if_has(prf, "discount_value", percentage)
+    _set_if_has(prf, "custom_kpws_welfare_percentage", percentage)
+    _set_if_has(prf, "custom_panel_customer", panel_customer)
+    _set_if_has(prf, "custom_kpws_assigned_panel_customer", panel_customer)
+    prf.save(ignore_permissions=True)
+
+    if cint(submit) and prf.docstatus == 0:
+        prf.submit()
+
+    # Sync back to patient
+    _set_if_has(p, "custom_kpws_funding_source", funding)
+    _set_if_has(p, "custom_panel_customer", panel_customer)
+    _set_if_has(p, "custom_kpws_active_prf", prf.name)
+    _set_if_has(p, "custom_kpws_approval_status", "Approved" if prf.docstatus == 1 else "Pending Approval")
+    p.save(ignore_permissions=True)
+    frappe.db.commit()
+    return {"registration": prf.name, "docstatus": prf.docstatus, "patient": _serialize_patient(patient)}
+
+
+@frappe.whitelist()
+def create_patient_token(patient):
+    if not _has_doctype("Patient Token"):
+        frappe.throw("Patient Token doctype not found")
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Patient is required")
+    p = frappe.get_doc(PATIENT_DT, patient)
+    doc = frappe.new_doc("Patient Token")
+    for f in ["patient", "custom_patient"]:
+        _set_if_has(doc, f, patient)
+    for f in ["patient_name", "custom_patient_name"]:
+        _set_if_has(doc, f, p.get("patient_name"))
+    for f in ["mr_no", "custom_mr_number", "custom_reference_number"]:
+        _set_if_has(doc, f, p.get("custom_reference_number"))
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return {"name": doc.name}
+
+
+@frappe.whitelist()
+def create_appointment(patient, appointment_date=None, appointment_time=None, practitioner=None):
+    if not _has_doctype("Patient Appointment"):
+        frappe.throw("Patient Appointment doctype not found")
+    if not patient or not frappe.db.exists(PATIENT_DT, patient):
+        frappe.throw("Patient is required")
+    doc = frappe.new_doc("Patient Appointment")
+    _set_if_has(doc, "patient", patient)
+    _set_if_has(doc, "appointment_date", appointment_date or nowdate())
+    _set_if_has(doc, "appointment_time", appointment_time or nowtime())
+    if practitioner:
+        _set_if_has(doc, "practitioner", practitioner)
+    doc.insert(ignore_permissions=True)
+    frappe.db.commit()
+    return {"name": doc.name}
+
+
+@frappe.whitelist()
+def get_context(patient=None):
+    out = {
+        "patient_types": PATIENT_TYPES,
+        "funding_sources": FUNDING_SOURCES,
+        "cnic_field": patient_cnic_field(),
+        "mobile_field": patient_mobile_field(),
+        "panel_customers": get_panel_customers(limit=20),
+    }
+    if patient:
+        out["patient"] = get_patient(patient)
+    return out
+
+
+
+# KPWS_PATIENT_INTAKE_V52_PATIENT_FIELD_MAPPING_FIX
+def _kpws_v52_normalize_payload_dict(value):
+    import json
+    import frappe
+
+    if value is None:
+        return {}
+
+    if isinstance(value, dict):
+        return frappe._dict(value)
+
+    if isinstance(value, str):
+        try:
+            return frappe._dict(json.loads(value))
+        except Exception:
+            return frappe._dict({})
+
+    try:
+        return frappe._dict(value)
+    except Exception:
+        return frappe._dict({})
+
+
+def _kpws_v52_set_if_has_field(doc, fieldname, value):
+    if value is None:
+        return
+
+    if value == "":
+        return
+
+    try:
+        if doc.meta.has_field(fieldname):
+            doc.set(fieldname, value)
+    except Exception:
+        pass
+
+
+def _kpws_v52_prepare_patient_before_save(doc, raw_payload=None):
+    """
+    Final safety mapping before saving Patient from KPWS Patient Intake.
+
+    Fixes:
+      MandatoryError: age_
+
+    Reason:
+      Patient doctype has required field age_, but the intake UI may send it
+      as age / patient_age / custom_age. This maps it safely.
+    """
+    import frappe
+
+    if not doc or getattr(doc, "doctype", None) != "Patient":
+        return doc
+
+    data = _kpws_v52_normalize_payload_dict(raw_payload)
+
+    def pick(*keys):
+        for key in keys:
+            value = data.get(key)
+            if value not in (None, ""):
+                return value
+        return None
+
+    # Name fields
+    _kpws_v52_set_if_has_field(doc, "first_name", pick("first_name", "patient_first_name"))
+    _kpws_v52_set_if_has_field(doc, "last_name", pick("last_name", "patient_last_name"))
+
+    # If first_name is still missing but patient_name/full_name was sent, split it.
+    full_name = pick("patient_name", "full_name", "name_text")
+    if full_name and doc.meta.has_field("first_name") and not doc.get("first_name"):
+        parts = str(full_name).strip().split()
+        if parts:
+            doc.first_name = parts[0]
+            if doc.meta.has_field("last_name") and len(parts) > 1:
+                doc.last_name = " ".join(parts[1:])
+
+    # Age field. Your Patient doctype mandatory field is age_.
+    age_value = pick("age_", "age", "patient_age", "custom_age")
+    if age_value not in (None, ""):
+        _kpws_v52_set_if_has_field(doc, "age_", age_value)
+        _kpws_v52_set_if_has_field(doc, "age", age_value)
+
+    # Gender/Sex. Healthcare Patient usually uses sex.
+    gender_value = pick("sex", "gender", "patient_gender")
+    if gender_value:
+        _kpws_v52_set_if_has_field(doc, "sex", gender_value)
+        _kpws_v52_set_if_has_field(doc, "gender", gender_value)
+
+    # Mobile
+    mobile_value = pick("mobile", "mobile_no", "phone", "contact", "custom_kpws_mobile_no")
+    if mobile_value:
+        _kpws_v52_set_if_has_field(doc, "mobile", mobile_value)
+        _kpws_v52_set_if_has_field(doc, "mobile_no", mobile_value)
+        _kpws_v52_set_if_has_field(doc, "phone", mobile_value)
+        _kpws_v52_set_if_has_field(doc, "custom_kpws_mobile_no", mobile_value)
+
+    # CNIC
+    cnic_value = pick("cnic", "cnic_number", "custom_kpws_cnic", "custom_cnic")
+    if cnic_value:
+        _kpws_v52_set_if_has_field(doc, "custom_kpws_cnic", cnic_value)
+        _kpws_v52_set_if_has_field(doc, "cnic", cnic_value)
+        _kpws_v52_set_if_has_field(doc, "cnic_number", cnic_value)
+
+    # MR numbers
+    _kpws_v52_set_if_has_field(doc, "custom_reference_number", pick("custom_reference_number", "mr_number", "kiran_mr_number"))
+    _kpws_v52_set_if_has_field(doc, "custom_old_kpws_number", pick("custom_old_kpws_number", "old_kpws_number"))
+
+    # Patient status
+    status_value = pick("patient_status", "status")
+    if status_value:
+        _kpws_v52_set_if_has_field(doc, "patient_status", status_value)
+        _kpws_v52_set_if_has_field(doc, "status", "Active" if status_value in ("SE", "E", "NE", "P") else status_value)
+
+    # Patient Type is customer_group in your system.
+    patient_type = pick("customer_group", "patient_type", "billing_type", "custom_billing_type")
+    if patient_type:
+        _kpws_v52_set_if_has_field(doc, "customer_group", patient_type)
+
+    # Funding source and panel customer
+    _kpws_v52_set_if_has_field(doc, "custom_kpws_funding_source", pick("custom_kpws_funding_source", "funding_source"))
+    _kpws_v52_set_if_has_field(doc, "custom_panel_customer", pick("custom_panel_customer", "panel_customer"))
+
+    # Patient details / relation notes
+    _kpws_v52_set_if_has_field(doc, "patient_details", pick("patient_details", "notes", "remarks"))
+    _kpws_v52_set_if_has_field(doc, "custom_relation_name", pick("relation_name", "son_of_daughter_of_wife_of", "guardian_name"))
+
+    # Final friendly validation for mandatory Patient fields.
+    missing = []
+    for df in doc.meta.fields:
+        if df.reqd and not doc.get(df.fieldname):
+            missing.append(df.label or df.fieldname)
+
+    if missing:
+        frappe.throw("Please fill mandatory Patient fields: " + ", ".join(missing))
+
+    return doc
+
+
+
+# KPWS_PATIENT_INTAKE_V52_FINAL_SAVE_PATIENT_OVERRIDE
+@frappe.whitelist()
+def save_patient(payload=None, data=None, **kwargs):
+    """
+    Final override for KPWS Patient Intake Desk.
+
+    Fixes:
+      MandatoryError: [Patient]: age_
+
+    It accepts any of these payload styles:
+      - payload JSON
+      - data JSON
+      - direct form_dict fields
+      - nested {"patient": {...}}
+    """
+    import json
+    import frappe
+    from frappe.utils import cint
+
+    def parse_any(value):
+        if not value:
+            return {}
+        if isinstance(value, dict):
+            return dict(value)
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return {}
+        try:
+            return dict(value)
+        except Exception:
+            return {}
+
+    raw = {}
+
+    # 1. JSON payload/data
+    raw.update(parse_any(payload))
+    raw.update(parse_any(data))
+
+    # 2. kwargs
+    raw.update(parse_any(kwargs))
+
+    # 3. frappe.form_dict
+    for k, v in dict(frappe.form_dict).items():
+        if k in ("cmd",):
+            continue
+
+        if k in ("payload", "data") and isinstance(v, str):
+            raw.update(parse_any(v))
+        else:
+            raw[k] = v
+
+    # 4. nested patient object
+    if isinstance(raw.get("patient"), dict):
+        nested = dict(raw.get("patient"))
+        nested.update({k: v for k, v in raw.items() if k != "patient"})
+        raw = nested
+
+    # Case-insensitive access
+    lower = {}
+    for k, v in raw.items():
+        lower[str(k).lower()] = v
+
+    def pick(*keys):
+        for key in keys:
+            if key in raw and raw.get(key) not in (None, ""):
+                return raw.get(key)
+            lk = str(key).lower()
+            if lk in lower and lower.get(lk) not in (None, ""):
+                return lower.get(lk)
+        return None
+
+    def has_field(doc, fieldname):
+        try:
+            return doc.meta.has_field(fieldname)
+        except Exception:
+            return False
+
+    def set_if_exists(doc, fieldname, value, allow_blank=False):
+        if value in (None, "") and not allow_blank:
+            return
+        if has_field(doc, fieldname):
+            doc.set(fieldname, value)
+
+    patient_name = pick("name", "patient_id", "patient_name_id", "patient_docname")
+
+    if patient_name and frappe.db.exists("Patient", patient_name):
+        doc = frappe.get_doc("Patient", patient_name)
+    else:
+        doc = frappe.new_doc("Patient")
+
+    # Naming series
+    naming_series = pick("naming_series", "series")
+    if naming_series and has_field(doc, "naming_series"):
+        doc.naming_series = naming_series
+
+    # Names
+    first_name = pick("first_name", "firstname", "patient_first_name")
+    last_name = pick("last_name", "lastname", "patient_last_name")
+    full_name = pick("patient_name", "full_name", "name_text", "fullName")
+
+    if not first_name and full_name:
+        parts = str(full_name).strip().split()
+        if parts:
+            first_name = parts[0]
+            if not last_name and len(parts) > 1:
+                last_name = " ".join(parts[1:])
+
+    set_if_exists(doc, "first_name", first_name)
+    set_if_exists(doc, "last_name", last_name)
+
+    # Age - your Patient doctype mandatory field is age_
+    age_value = pick("age_", "age", "patient_age", "custom_age")
+    set_if_exists(doc, "age_", age_value)
+    set_if_exists(doc, "age", age_value)
+
+    # Gender / Sex
+    gender_value = pick("sex", "gender", "patient_gender")
+    set_if_exists(doc, "sex", gender_value)
+    set_if_exists(doc, "gender", gender_value)
+
+    # Patient status / active status
+    patient_status = pick("patient_status")
+    if not patient_status:
+        patient_status = "SE"
+
+    set_if_exists(doc, "patient_status", patient_status)
+
+    if has_field(doc, "status") and not doc.get("status"):
+        doc.status = "Active"
+
+    # CNIC fields
+    cnic_value = pick(
+        "cnic",
+        "cnic_number",
+        "custom_kpws_cnic",
+        "custom_cnic",
+        "custom_cnic_number"
+    )
+
+    set_if_exists(doc, "custom_kpws_cnic", cnic_value)
+    set_if_exists(doc, "cnic", cnic_value)
+    set_if_exists(doc, "cnic_number", cnic_value)
+    set_if_exists(doc, "custom_cnic", cnic_value)
+    set_if_exists(doc, "custom_cnic_number", cnic_value)
+
+    # MR / old KPWS no
+    set_if_exists(doc, "custom_reference_number", pick("custom_reference_number", "mr_number", "kiran_mr_number", "mr_no"))
+    set_if_exists(doc, "custom_old_kpws_number", pick("custom_old_kpws_number", "old_kpws_number", "old_kpws_no"))
+
+    # Mobile
+    mobile_value = pick("mobile", "mobile_no", "phone", "contact", "custom_kpws_mobile_no")
+    set_if_exists(doc, "mobile", mobile_value)
+    set_if_exists(doc, "mobile_no", mobile_value)
+    set_if_exists(doc, "phone", mobile_value)
+    set_if_exists(doc, "custom_kpws_mobile_no", mobile_value)
+
+    # Relation / guardian
+    relation_value = pick("relation_name", "son_of_daughter_of_wife_of", "guardian_name", "father_name")
+    set_if_exists(doc, "custom_relation_name", relation_value)
+    set_if_exists(doc, "relation_name", relation_value)
+
+    # Patient Type uses Customer Group in your setup
+    patient_type = pick("customer_group", "patient_type", "billing_type", "custom_billing_type")
+    if patient_type:
+        set_if_exists(doc, "customer_group", patient_type)
+
+    # Funding source and panel
+    funding_source = pick("custom_kpws_funding_source", "funding_source")
+    panel_customer = pick("custom_panel_customer", "panel_customer", "custom_kpws_panel_customer")
+
+    set_if_exists(doc, "custom_kpws_funding_source", funding_source)
+    set_if_exists(doc, "custom_panel_customer", panel_customer)
+    set_if_exists(doc, "custom_kpws_panel_customer", panel_customer)
+
+    # Notes
+    set_if_exists(doc, "patient_details", pick("patient_details", "notes", "remarks", "address"))
+
+    # Friendly mandatory validation before ERPNext raw error
+    missing = []
+
+    for df in doc.meta.fields:
+        if not cint(df.reqd):
+            continue
+
+        value = doc.get(df.fieldname)
+
+        if value in (None, "", []):
+            missing.append(df.label or df.fieldname)
+
+    if missing:
+        frappe.throw("Please fill mandatory Patient fields: " + ", ".join(missing))
+
+    # Duplicate CNIC check against all possible CNIC fields that exist
+    if cnic_value:
+        normalized_cnic = "".join(ch for ch in str(cnic_value) if ch.isdigit())
+
+        cnic_fields = [
+            "custom_kpws_cnic",
+            "cnic",
+            "cnic_number",
+            "custom_cnic",
+            "custom_cnic_number",
+        ]
+
+        for fieldname in cnic_fields:
+            if not has_field(doc, fieldname):
+                continue
+
+            rows = frappe.get_all(
+                "Patient",
+                filters={fieldname: ["is", "set"]},
+                fields=["name", fieldname],
+                limit=500,
+            )
+
+            for row in rows:
+                if row.name == doc.name:
+                    continue
+
+                existing_value = row.get(fieldname)
+                existing_norm = "".join(ch for ch in str(existing_value or "") if ch.isdigit())
+
+                if normalized_cnic and existing_norm and normalized_cnic == existing_norm:
+                    frappe.throw(
+                        "Patient already exists with this CNIC: {0}. Existing Patient: {1}".format(
+                            cnic_value,
+                            row.name,
+                        )
+                    )
+
+    doc.save(ignore_permissions=True)
+    frappe.db.commit()
+
+    return {
+        "ok": True,
+        "patient": doc.name,
+        "name": doc.name,
+        "patient_name": doc.get("patient_name") or " ".join(
+            [str(doc.get("first_name") or ""), str(doc.get("last_name") or "")]
+        ).strip(),
+        "customer_group": doc.get("customer_group"),
+        "funding_source": doc.get("custom_kpws_funding_source"),
+        "panel_customer": doc.get("custom_panel_customer"),
+    }

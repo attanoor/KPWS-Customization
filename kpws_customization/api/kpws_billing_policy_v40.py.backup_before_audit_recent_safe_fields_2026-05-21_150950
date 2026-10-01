@@ -1,0 +1,686 @@
+# -*- coding: utf-8 -*-
+"""
+KPWS Billing Policy v40
+Single source of truth for KPWS Pharmacy Billing accounting.
+
+Rules:
+1. Cash / Walk-in:
+   - POS invoice: is_pos = 1
+   - payments table contains only real Cash/Card modes
+   - Dr Cash/Bank, Cr Sales Pharmacy
+
+2. Welfare:
+   - Normal Sales Invoice: is_pos = 0, no POS payments
+   - Debit To = WELFARE RECEIVABLE - KPWS
+   - Covered amount from approved Patient Registration Form percentage
+   - Auto JV: Dr ZAKAT/DONATION DISBURSE, Cr WELFARE RECEIVABLE, allocated to Sales Invoice
+   - Patient share: Payment Entry to Cash Pharmacy/Card, allocated to Sales Invoice
+
+3. Panel:
+   - Normal Sales Invoice: is_pos = 0, no POS payments
+   - Customer = assigned panel/bill-to customer
+   - Debit To = panel/customer receivable ledger
+   - Income = SALES (PANEL) - KPWS
+"""
+
+import json
+import frappe
+from frappe import _
+from frappe.utils import flt, cint, nowdate
+
+COMPANY = "Kiran Patient Welfare Society"
+WELFARE_RECEIVABLE = "WELFARE RECEIVABLE - KPWS"
+CASH_PHARMACY_ACCOUNT = "CASH (PHARMACY) - KPWS"
+SALES_PHARMACY = "SALES (PHARMACY) - KPWS"
+SALES_PANEL = "SALES (PANEL) - KPWS"
+COGS_PHARMACY = "COST OF GOODS SOLD - KPWS"
+ZAKAT_DISBURSE = "ZAKAT DISBURSE - KPWS"
+DONATION_DISBURSE = "DONATION DISBURSE - KPWS"
+PANEL_RECEIVABLE_PARENT = "PANEL RECEIVABLES - KPWS"
+
+BAD_ASSISTANCE_MODES = {"zakat", "donation", "welfare", "panel"}
+
+
+def _get_settings():
+    return frappe.get_single("KPWS Pharmacy Billing Settings")
+
+
+def _has_field(doctype, fieldname):
+    return frappe.get_meta(doctype).has_field(fieldname)
+
+
+def _set_if_has(doc, fieldname, value):
+    if doc.meta.has_field(fieldname):
+        doc.set(fieldname, value)
+
+
+def _money(value):
+    return flt(value or 0, 2)
+
+
+def _ensure_account(account_name, parent_account, root_type="Asset", account_type=None):
+    if frappe.db.exists("Account", account_name):
+        return account_name
+
+    parent = frappe.get_doc("Account", parent_account)
+    if not cint(parent.is_group):
+        frappe.throw(_("Parent account {0} is not a group account").format(parent_account))
+
+    acc = frappe.new_doc("Account")
+    acc.account_name = account_name.replace(" - KPWS", "")
+    acc.company = COMPANY
+    acc.parent_account = parent_account
+    acc.root_type = root_type
+    acc.report_type = "Balance Sheet" if root_type in ("Asset", "Liability", "Equity") else "Profit and Loss"
+    acc.is_group = 0
+    if account_type:
+        acc.account_type = account_type
+    acc.insert(ignore_permissions=True)
+    return acc.name
+
+
+def _account_is_ledger(account):
+    if not account or not frappe.db.exists("Account", account):
+        return False
+    return not cint(frappe.db.get_value("Account", account, "is_group"))
+
+
+def _ensure_cash_pharmacy_mop():
+    """Return a Mode of Payment mapped to CASH (PHARMACY) - KPWS."""
+    rows = frappe.db.sql(
+        """
+        SELECT parent
+        FROM `tabMode of Payment Account`
+        WHERE company=%s AND default_account=%s
+        LIMIT 1
+        """,
+        (COMPANY, CASH_PHARMACY_ACCOUNT),
+        as_dict=True,
+    )
+    if rows:
+        return rows[0].parent
+
+    mop_name = "Cash Pharmacy"
+    if frappe.db.exists("Mode of Payment", mop_name):
+        mop = frappe.get_doc("Mode of Payment", mop_name)
+    else:
+        mop = frappe.new_doc("Mode of Payment")
+        mop.mode_of_payment = mop_name
+        mop.type = "Cash"
+
+    found = False
+    for row in mop.get("accounts") or []:
+        if row.company == COMPANY:
+            row.default_account = CASH_PHARMACY_ACCOUNT
+            found = True
+
+    if not found:
+        mop.append("accounts", {"company": COMPANY, "default_account": CASH_PHARMACY_ACCOUNT})
+
+    if mop.is_new():
+        mop.insert(ignore_permissions=True)
+    else:
+        mop.save(ignore_permissions=True)
+
+    return mop_name
+
+
+def _mop_account(mode_of_payment, company):
+    if not mode_of_payment or not frappe.db.exists("Mode of Payment", mode_of_payment):
+        return None
+    mop = frappe.get_doc("Mode of Payment", mode_of_payment)
+    for row in mop.get("accounts") or []:
+        if row.company == company and row.default_account:
+            return row.default_account
+    return None
+
+
+def _get_cash_mop(settings=None):
+    settings = settings or _get_settings()
+    mop = settings.get("cash_mode_of_payment") or settings.get("default_mode_of_payment")
+    if mop and _mop_account(mop, COMPANY):
+        return mop
+    return _ensure_cash_pharmacy_mop()
+
+
+def _get_card_mop(settings=None):
+    settings = settings or _get_settings()
+    return settings.get("card_mode_of_payment")
+
+
+def _ancestor_groups(group):
+    out = []
+    while group:
+        out.append(group)
+        parent = frappe.db.get_value("Customer Group", group, "parent_customer_group")
+        if not parent or parent == group:
+            break
+        group = parent
+    return out
+
+
+def normalize_billing_group(customer=None, fallback="Cash"):
+    """Customer Group controls the billing nature: Cash, Welfare, Panel."""
+    fallback = fallback or "Cash"
+    if not customer or not frappe.db.exists("Customer", customer):
+        return fallback
+
+    cg = frappe.db.get_value("Customer", customer, "customer_group")
+    groups = [g.lower() for g in _ancestor_groups(cg)] if cg else []
+
+    if any("panel" in g for g in groups):
+        return "Panel"
+    if any("welfare" in g or "zakat" in g or "donation" in g for g in groups):
+        return "Welfare"
+    if any("cash" in g or "walk" in g for g in groups):
+        return "Cash"
+    return fallback
+
+
+def get_panel_receivable_account(panel_customer, company=None):
+    company = company or COMPANY
+
+    # Prefer customer-specific receivable account if configured.
+    if panel_customer and frappe.db.exists("Customer", panel_customer):
+        cust = frappe.get_doc("Customer", panel_customer)
+        for row in cust.get("accounts") or []:
+            if row.company == company and row.account and _account_is_ledger(row.account):
+                return row.account
+
+    settings = _get_settings()
+    configured = settings.get("panel_receivable_account")
+    if configured and _account_is_ledger(configured):
+        return configured
+
+    # If a ledger exists with customer name under panel receivables, use it.
+    if panel_customer:
+        candidates = frappe.get_all(
+            "Account",
+            filters={"company": company, "parent_account": PANEL_RECEIVABLE_PARENT, "is_group": 0},
+            fields=["name"],
+        )
+        needle = panel_customer.lower()
+        for row in candidates:
+            if needle in row.name.lower():
+                return row.name
+
+    # Fall back to standard customer receivable if no panel ledger is configured.
+    default_receivable = frappe.db.get_value("Company", company, "default_receivable_account")
+    if default_receivable:
+        return default_receivable
+
+    frappe.throw(_("Panel Receivable Account is missing. Set a ledger account in KPWS Pharmacy Billing Settings or Customer > Accounting."))
+
+
+def _latest_welfare_registration(patient):
+    if not patient:
+        return {}
+
+    possible_doctypes = ["Patient Registration Form", "KPWS Patient Registration Form"]
+
+    for dt in possible_doctypes:
+        if not frappe.db.exists("DocType", dt):
+            continue
+        meta = frappe.get_meta(dt)
+
+        patient_field = None
+        for f in ["patient", "custom_patient", "custom_kpws_patient", "patient_id", "custom_patient_id"]:
+            if meta.has_field(f):
+                patient_field = f
+                break
+        if not patient_field:
+            continue
+
+        filters = {patient_field: patient, "docstatus": 1}
+        rows = frappe.get_all(dt, filters=filters, fields=["name"], order_by="modified desc", limit=1)
+        if not rows:
+            continue
+
+        reg = frappe.get_doc(dt, rows[0].name)
+        purpose = None
+        for f in ["purpose", "custom_kpws_welfare_type", "custom_welfare_type", "assistance_source", "custom_assistance_source"]:
+            if meta.has_field(f) and reg.get(f):
+                purpose = reg.get(f)
+                break
+
+        percentage = 0
+        for f in ["custom_kpws_welfare_percentage", "custom_welfare_percentage", "discount_value", "custom_discount_value", "percentage", "assistance_percentage", "custom_assistance_percentage"]:
+            if meta.has_field(f) and reg.get(f) is not None:
+                percentage = _money(reg.get(f))
+                break
+
+        panel_customer = None
+        for f in ["panel_customer", "custom_panel_customer", "custom_panel", "panel_name", "custom_panel_name"]:
+            if meta.has_field(f) and reg.get(f):
+                panel_customer = reg.get(f)
+                break
+
+        return {"doctype": dt, "name": reg.name, "purpose": purpose or "Zakat", "percentage": percentage, "panel_customer": panel_customer}
+
+    return {}
+
+
+def compute_welfare_split(patient, total, card_amount=0):
+    total = _money(total)
+    reg = _latest_welfare_registration(patient)
+    pct = max(0, min(_money(reg.get("percentage")), 100))
+    covered = _money(total * pct / 100)
+    patient_share = _money(total - covered)
+    card = min(_money(card_amount), patient_share)
+    cash = _money(patient_share - card)
+    return {
+        "total": total,
+        "covered_amount": covered,
+        "patient_share": patient_share,
+        "patient_cash": cash,
+        "patient_card": card,
+        "purpose": reg.get("purpose") or "Zakat",
+        "percentage": pct,
+        "registration": reg.get("name"),
+    }
+
+
+def get_policy_payment_plan(group, total, patient=None, card_amount=0):
+    settings = _get_settings()
+    total = _money(total)
+    group = group or "Cash"
+    rows, warnings = [], []
+
+    if total <= 0:
+        return {"total": total, "group": group, "rows": [], "warnings": ["Invoice total is zero."], "covered_amount": 0, "patient_share": 0}
+
+    if group == "Panel":
+        return {
+            "total": total,
+            "group": "Panel",
+            "rows": [{"label": "Panel Receivable", "role": "panel_receivable", "mode_of_payment": None, "amount": total, "editable": 0}],
+            "warnings": [],
+            "covered_amount": 0,
+            "patient_share": 0,
+            "is_pos": 0,
+        }
+
+    if group == "Welfare":
+        split = compute_welfare_split(patient, total, card_amount=card_amount)
+        purpose = split["purpose"]
+        if split["covered_amount"] > 0:
+            rows.append({"label": purpose, "role": "welfare_journal", "mode_of_payment": None, "amount": split["covered_amount"], "editable": 0})
+        if split["patient_card"] > 0:
+            card_mop = _get_card_mop(settings)
+            if not card_mop:
+                warnings.append("Card Mode of Payment is missing in KPWS Pharmacy Billing Settings.")
+            rows.append({"label": "Patient Card Share", "role": "patient_card", "mode_of_payment": card_mop, "amount": split["patient_card"], "editable": 1})
+        if split["patient_cash"] > 0:
+            rows.append({"label": "Patient Cash Share", "role": "patient_cash", "mode_of_payment": _get_cash_mop(settings), "amount": split["patient_cash"], "editable": 1})
+        split.update({"group": "Welfare", "rows": rows, "warnings": warnings, "is_pos": 0})
+        return split
+
+    # Cash/Walk-in = real POS payment rows.
+    card = min(_money(card_amount), total)
+    cash = _money(total - card)
+    if card > 0:
+        card_mop = _get_card_mop(settings)
+        if not card_mop:
+            warnings.append("Card Mode of Payment is missing in KPWS Pharmacy Billing Settings.")
+        rows.append({"label": "Card", "role": "card", "mode_of_payment": card_mop, "amount": card, "editable": 1})
+    if cash > 0:
+        rows.append({"label": "Cash", "role": "cash", "mode_of_payment": _get_cash_mop(settings), "amount": cash, "editable": 1})
+    return {"total": total, "group": "Cash", "rows": rows, "warnings": warnings, "covered_amount": 0, "patient_share": total, "patient_cash": cash, "patient_card": card, "purpose": "Cash", "percentage": 0, "is_pos": 1}
+
+
+def apply_invoice_policy_before_insert(si, *, group, patient=None, bill_to_customer=None, payment_plan=None, registration=None, company=None):
+    """Apply accounting policy before Sales Invoice insert/submit."""
+    settings = _get_settings()
+    company = company or si.company or COMPANY
+    group = group or "Cash"
+    payment_plan = payment_plan or {}
+    registration = registration or {}
+
+    if group == "Cash" or group == "Walk-in":
+        si.is_pos = 1
+        # real payment rows only
+        si.set("payments", [])
+        for row in payment_plan.get("rows") or []:
+            if row.get("role") not in ("cash", "card"):
+                continue
+            amount = _money(row.get("amount"))
+            mode = row.get("mode_of_payment")
+            if amount <= 0:
+                continue
+            if not mode:
+                frappe.throw(_("Mode of Payment missing for {0}").format(row.get("label") or "payment"))
+            if not _mop_account(mode, company):
+                frappe.throw(_("Mode of Payment {0} has no Cash/Bank default account for {1}").format(mode, company))
+            si.append("payments", {"mode_of_payment": mode, "amount": amount})
+        return
+
+    # Panel and Welfare are never POS in corrected accounting.
+    si.is_pos = 0
+    si.pos_profile = None
+    si.set("payments", [])
+
+    if group == "Welfare":
+        welfare_receivable = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+        if not _account_is_ledger(welfare_receivable):
+            frappe.throw(_("Welfare Receivable Account must be a ledger account."))
+        si.debit_to = welfare_receivable
+        _set_if_has(si, "custom_kpws_welfare_covered_amount", payment_plan.get("covered_amount"))
+        _set_if_has(si, "custom_kpws_patient_share_amount", payment_plan.get("patient_share"))
+        _set_if_has(si, "custom_kpws_patient_cash_amount", payment_plan.get("patient_cash"))
+        _set_if_has(si, "custom_kpws_patient_card_amount", payment_plan.get("patient_card"))
+        _set_if_has(si, "custom_kpws_purpose", payment_plan.get("purpose") or registration.get("purpose"))
+        _set_if_has(si, "custom_kpws_approved_percentage", payment_plan.get("percentage") or registration.get("percentage"))
+        return
+
+    if group == "Panel":
+        si.debit_to = get_panel_receivable_account(bill_to_customer or si.customer, company)
+        return
+
+
+def apply_item_accounts(si, group):
+    income = SALES_PANEL if group == "Panel" else SALES_PHARMACY
+    expense = COGS_PHARMACY
+    for item in si.get("items") or []:
+        if item.meta.has_field("income_account"):
+            item.income_account = income
+        if item.meta.has_field("expense_account"):
+            item.expense_account = expense
+
+
+def _existing_payment(si_name, mode_of_payment):
+    rows = frappe.db.sql(
+        """
+        SELECT pe.name
+        FROM `tabPayment Entry Reference` ref
+        INNER JOIN `tabPayment Entry` pe ON pe.name = ref.parent
+        WHERE ref.reference_doctype='Sales Invoice'
+          AND ref.reference_name=%s
+          AND pe.mode_of_payment=%s
+          AND pe.docstatus=1
+        LIMIT 1
+        """,
+        (si_name, mode_of_payment),
+        as_dict=True,
+    )
+    return rows[0].name if rows else None
+
+
+def _existing_welfare_je(si_name):
+    rows = frappe.db.sql(
+        """
+        SELECT je.name
+        FROM `tabJournal Entry Account` acc
+        INNER JOIN `tabJournal Entry` je ON je.name=acc.parent
+        WHERE acc.reference_type='Sales Invoice'
+          AND acc.reference_name=%s
+          AND acc.credit_in_account_currency > 0
+          AND je.docstatus=1
+        LIMIT 1
+        """,
+        (si_name,),
+        as_dict=True,
+    )
+    return rows[0].name if rows else None
+
+
+def create_patient_share_payment(si, mode_of_payment, amount, link_field=None):
+    amount = _money(amount)
+    if amount <= 0:
+        return None
+    if not mode_of_payment:
+        frappe.throw(_("Patient share Mode of Payment is missing."))
+    existing = _existing_payment(si.name, mode_of_payment)
+    if existing:
+        if link_field and si.meta.has_field(link_field):
+            frappe.db.set_value("Sales Invoice", si.name, link_field, existing, update_modified=False)
+        return existing
+
+    paid_to = _mop_account(mode_of_payment, si.company)
+    if not paid_to:
+        frappe.throw(_("Mode of Payment {0} has no default account for {1}").format(mode_of_payment, si.company))
+
+    pe = frappe.new_doc("Payment Entry")
+    pe.payment_type = "Receive"
+    pe.company = si.company
+    pe.posting_date = si.posting_date or nowdate()
+    pe.mode_of_payment = mode_of_payment
+    pe.party_type = "Customer"
+    pe.party = si.customer
+    pe.paid_from = si.debit_to
+    pe.paid_to = paid_to
+    pe.paid_amount = amount
+    pe.received_amount = amount
+    pe.reference_no = si.name
+    pe.reference_date = si.posting_date or nowdate()
+    pe.append("references", {"reference_doctype": "Sales Invoice", "reference_name": si.name, "allocated_amount": amount})
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+    if link_field and si.meta.has_field(link_field):
+        frappe.db.set_value("Sales Invoice", si.name, link_field, pe.name, update_modified=False)
+    return pe.name
+
+
+def create_welfare_journal(si, amount, purpose):
+    amount = _money(amount)
+    if amount <= 0:
+        return None
+    existing = _existing_welfare_je(si.name)
+    if existing:
+        if si.meta.has_field("custom_kpws_auto_journal_entry"):
+            frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_auto_journal_entry", existing, update_modified=False)
+        return existing
+
+    settings = _get_settings()
+    purpose_lower = (purpose or "Zakat").lower()
+    if "donation" in purpose_lower:
+        expense_account = settings.get("donation_disbursement_account") or DONATION_DISBURSE
+        label = "Donation"
+    else:
+        expense_account = settings.get("zakat_disbursement_account") or ZAKAT_DISBURSE
+        label = "Zakat"
+    if not expense_account or not frappe.db.exists("Account", expense_account):
+        frappe.throw(_("{0} Disbursement Account is missing in KPWS Pharmacy Billing Settings.").format(label))
+
+    je = frappe.new_doc("Journal Entry")
+    je.voucher_type = "Journal Entry"
+    je.company = si.company
+    je.posting_date = si.posting_date or nowdate()
+    je.user_remark = "Auto {0} welfare settlement against Sales Invoice {1}".format(label, si.name)
+    je.append("accounts", {"account": expense_account, "debit_in_account_currency": amount, "credit_in_account_currency": 0})
+    je.append("accounts", {
+        "account": si.debit_to,
+        "party_type": "Customer",
+        "party": si.customer,
+        "reference_type": "Sales Invoice",
+        "reference_name": si.name,
+        "debit_in_account_currency": 0,
+        "credit_in_account_currency": amount,
+    })
+    je.insert(ignore_permissions=True)
+    je.submit()
+    if si.meta.has_field("custom_kpws_auto_journal_entry"):
+        frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_auto_journal_entry", je.name, update_modified=False)
+    return je.name
+
+
+def is_welfare_invoice(si):
+    settings = _get_settings()
+    welfare_receivable = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+    return bool(
+        si.get("custom_kpws_patient_billing_group") == "Welfare"
+        or si.debit_to == welfare_receivable
+        or si.get("custom_kpws_welfare_covered_amount")
+        or si.get("custom_kpws_patient_share_amount")
+    )
+
+
+def is_panel_invoice(si):
+    return bool(si.get("custom_kpws_patient_billing_group") == "Panel")
+
+
+def before_submit_sales_invoice(doc, method=None):
+    """Final safeguard before ERPNext submit."""
+    if is_welfare_invoice(doc):
+        settings = _get_settings()
+        doc.is_pos = 0
+        doc.pos_profile = None
+        doc.debit_to = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+        doc.set("payments", [])
+    elif is_panel_invoice(doc):
+        doc.is_pos = 0
+        doc.pos_profile = None
+        doc.debit_to = get_panel_receivable_account(doc.customer, doc.company)
+        doc.set("payments", [])
+
+    group = doc.get("custom_kpws_patient_billing_group") or ("Panel" if is_panel_invoice(doc) else "Welfare" if is_welfare_invoice(doc) else "Cash")
+    apply_item_accounts(doc, group)
+
+
+def on_submit_sales_invoice(doc, method=None):
+    if getattr(frappe.flags, "kpws_billing_v40_running", False):
+        return
+    if not is_welfare_invoice(doc):
+        return
+
+    try:
+        frappe.flags.kpws_billing_v40_running = True
+        si = frappe.get_doc("Sales Invoice", doc.name)
+        settings = _get_settings()
+        cash_amount = _money(si.get("custom_kpws_patient_cash_amount"))
+        card_amount = _money(si.get("custom_kpws_patient_card_amount"))
+        covered = _money(si.get("custom_kpws_welfare_covered_amount"))
+        purpose = si.get("custom_kpws_purpose") or "Zakat"
+
+        if cash_amount > 0:
+            create_patient_share_payment(si, _get_cash_mop(settings), cash_amount, "custom_kpws_cash_payment_entry")
+        if card_amount > 0:
+            create_patient_share_payment(si, _get_card_mop(settings), card_amount, "custom_kpws_card_payment_entry")
+        if covered > 0:
+            create_welfare_journal(si, covered, purpose)
+
+        si.reload()
+        try:
+            si.set_status(update=True)
+        except Exception:
+            pass
+        frappe.db.commit()
+    finally:
+        frappe.flags.kpws_billing_v40_running = False
+
+
+def before_cancel_sales_invoice(doc, method=None):
+    """Cancel auto-created settlements before invoice cancellation."""
+    for field, doctype in [
+        ("custom_kpws_cash_payment_entry", "Payment Entry"),
+        ("custom_kpws_card_payment_entry", "Payment Entry"),
+        ("custom_kpws_auto_journal_entry", "Journal Entry"),
+    ]:
+        name = doc.get(field)
+        if name and frappe.db.exists(doctype, name):
+            d = frappe.get_doc(doctype, name)
+            if d.docstatus == 1:
+                d.cancel()
+
+
+def protect_submitted_invoice_before_save(doc, method=None):
+    """Prevent client scripts from changing submitted KPWS invoices."""
+    if doc.doctype != "Sales Invoice" or doc.docstatus != 1 or not doc.name:
+        return
+
+    db = frappe.get_doc("Sales Invoice", doc.name)
+    is_kpws = bool(
+        doc.name.startswith("SINV-KPWS")
+        or db.get("custom_kpws_patient_billing_group") in ("Welfare", "Panel")
+        or db.debit_to in (WELFARE_RECEIVABLE, get_panel_receivable_account(db.customer, db.company) if db.get("custom_kpws_patient_billing_group") == "Panel" else None)
+        or db.get("custom_kpws_welfare_covered_amount")
+        or db.get("custom_kpws_auto_journal_entry")
+        or db.get("custom_kpws_cash_payment_entry")
+    )
+    if not is_kpws:
+        return
+
+    protected = [
+        "customer", "customer_name", "debit_to", "is_pos", "pos_profile",
+        "selling_price_list", "price_list_currency", "plc_conversion_rate", "conversion_rate",
+        "currency", "company", "posting_date", "set_posting_time", "due_date", "update_stock",
+        "set_warehouse", "status", "outstanding_amount", "grand_total", "rounded_total",
+        "base_grand_total", "base_rounded_total", "total", "base_total", "net_total", "base_net_total",
+    ]
+    for f in protected:
+        if doc.meta.has_field(f):
+            doc.set(f, db.get(f))
+
+    for f in [
+        "custom_kpws_welfare_covered_amount", "custom_kpws_patient_share_amount",
+        "custom_kpws_patient_cash_amount", "custom_kpws_patient_card_amount",
+        "custom_kpws_cash_payment_entry", "custom_kpws_card_payment_entry", "custom_kpws_auto_journal_entry",
+        "custom_kpws_purpose", "custom_kpws_approved_percentage", "custom_kpws_patient_billing_group",
+    ]:
+        if doc.meta.has_field(f):
+            doc.set(f, db.get(f))
+
+    for tablefield in ["items", "taxes", "payments", "advances", "payment_schedule", "sales_team", "packed_items", "pricing_rules"]:
+        if not doc.meta.has_field(tablefield):
+            continue
+        doc.set(tablefield, [])
+        for old in db.get(tablefield) or []:
+            new = doc.append(tablefield, {})
+            for key, value in old.as_dict().items():
+                if key not in ("doctype", "parent", "parenttype", "parentfield"):
+                    new.set(key, value)
+            new.name = old.name
+            new.idx = old.idx
+
+
+def repair_invoice(si_name):
+    si = frappe.get_doc("Sales Invoice", si_name)
+    if not is_welfare_invoice(si):
+        return {"ok": False, "message": "Not a welfare invoice"}
+    # ensure no POS payments and settle missing amounts
+    frappe.db.set_value("Sales Invoice", si.name, "is_pos", 0, update_modified=False)
+    frappe.db.set_value("Sales Invoice", si.name, "pos_profile", "", update_modified=False)
+    frappe.db.sql("DELETE FROM `tabSales Invoice Payment` WHERE parent=%s AND parenttype='Sales Invoice'", si.name)
+    frappe.db.commit()
+    on_submit_sales_invoice(si)
+    return frappe.db.get_value("Sales Invoice", si.name, ["status", "outstanding_amount", "custom_kpws_cash_payment_entry", "custom_kpws_card_payment_entry", "custom_kpws_auto_journal_entry"], as_dict=True)
+
+
+@frappe.whitelist()
+def audit_recent(limit=20):
+    rows = frappe.get_all(
+        "Sales Invoice",
+        filters={"name": ["like", "SINV-KPWS%"]},
+        fields=["name", "customer", "status", "outstanding_amount", "is_pos", "debit_to", "selling_price_list", "custom_kpws_patient_billing_group", "custom_kpws_welfare_covered_amount", "custom_kpws_patient_share_amount", "custom_kpws_cash_payment_entry", "custom_kpws_auto_journal_entry"],
+        order_by="creation desc",
+        limit=limit,
+    )
+    return rows
+
+
+def setup():
+    """Create accounts/settings and remove bad POS profile modes."""
+    _ensure_account(WELFARE_RECEIVABLE, "CURRENT ASSETS - KPWS", "Asset", "Receivable")
+    cash_mop = _ensure_cash_pharmacy_mop()
+
+    settings = _get_settings()
+    settings.welfare_receivable_account = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+    settings.zakat_disbursement_account = settings.get("zakat_disbursement_account") or ZAKAT_DISBURSE
+    settings.donation_disbursement_account = settings.get("donation_disbursement_account") or DONATION_DISBURSE
+    settings.cash_income_account = settings.get("cash_income_account") or SALES_PHARMACY
+    settings.panel_income_account = settings.get("panel_income_account") or SALES_PANEL
+    settings.pharmacy_cogs_account = settings.get("pharmacy_cogs_account") or COGS_PHARMACY
+    settings.cash_mode_of_payment = settings.get("cash_mode_of_payment") or cash_mop
+    settings.panel_billing_mode = "Receivable"
+    if hasattr(settings, "enable_welfare_auto_journal"):
+        settings.enable_welfare_auto_journal = 1
+    if hasattr(settings, "enable_welfare_patient_share_payment_entry"):
+        settings.enable_welfare_patient_share_payment_entry = 1
+    settings.save(ignore_permissions=True)
+
+    # Remove assistance modes from POS Profiles permanently.
+    rows = frappe.get_all("POS Payment Method", filters={"mode_of_payment": ["in", ["Zakat", "Donation", "Welfare", "Panel"]]}, pluck="name")
+    for name in rows:
+        frappe.db.delete("POS Payment Method", {"name": name})
+
+    frappe.db.commit()
+    return {"ok": True, "cash_mode_of_payment": cash_mop, "removed_pos_payment_rows": len(rows)}

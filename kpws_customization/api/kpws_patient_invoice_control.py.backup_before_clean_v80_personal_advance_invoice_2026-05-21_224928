@@ -1,0 +1,1017 @@
+import frappe
+from frappe import _
+from frappe.utils import cint, escape_html
+
+
+INVOICE_PATIENT_FIELDS = (
+    "patient",
+    "custom_patient",
+    "healthcare_patient",
+    "custom_healthcare_patient",
+    "patient_id",
+    "custom_patient_id",
+)
+
+PATIENT_GROUP_FIELDS = (
+    "customer_group",
+    "custom_customer_group",
+    "billing_type",
+    "custom_billing_type",
+    "patient_type",
+    "custom_patient_type",
+    "member_type",
+    "custom_member_type",
+)
+
+PATIENT_PANEL_FIELDS = (
+    "panel_name",
+    "custom_panel_name",
+    "panel_customer",
+    "custom_panel_customer",
+    "panel",
+    "custom_panel",
+)
+
+WELFARE_REGISTRATION_DOCTYPES = (
+    "Welfare Registration Form",
+    "Patient Welfare Registration Form",
+    "Patient Welfare Registeration Form",
+    "Welfare Patient Registration",
+    "Welfare Patient Registeration",
+    "Patient Registration Form",
+    "Patient Registeration Form",
+)
+
+REGISTRATION_STATUS_FIELDS = (
+    "workflow_state",
+    "status",
+    "registration_status",
+    "custom_registration_status",
+    "welfare_status",
+    "custom_welfare_status",
+)
+
+
+def _meta_has_field(doctype, fieldname):
+    try:
+        return frappe.get_meta(doctype).has_field(fieldname)
+    except Exception:
+        return False
+
+
+def _get_first_value(doc, fields):
+    for fieldname in fields:
+        if _meta_has_field(doc.doctype, fieldname):
+            value = doc.get(fieldname)
+            if value:
+                return value
+    return None
+
+
+def _normalize_group(value):
+    value = (value or "").strip()
+    lowered = value.lower()
+
+    if "welfare" in lowered:
+        return "Welfare"
+
+    if "panel" in lowered:
+        return "Panel"
+
+    if "cash" in lowered:
+        return "Cash"
+
+    return value
+
+
+def _panel_flag_field():
+    customer_meta = frappe.get_meta("Customer")
+
+    for fieldname in ("is_panel", "custom_is_panel"):
+        if customer_meta.has_field(fieldname):
+            return fieldname
+
+    return None
+
+
+def _find_customer_by_name_or_customer_name(value):
+    if not value:
+        return None
+
+    if frappe.db.exists("Customer", value):
+        return frappe.get_doc("Customer", value)
+
+    name = frappe.db.get_value("Customer", {"customer_name": value}, "name")
+    if name:
+        return frappe.get_doc("Customer", name)
+
+    return None
+
+
+def _get_patient_group(patient_doc):
+    group = _get_first_value(patient_doc, PATIENT_GROUP_FIELDS)
+
+    if group:
+        return _normalize_group(group)
+
+    customer = None
+    if _meta_has_field("Patient", "customer"):
+        customer = patient_doc.get("customer")
+
+    if customer and frappe.db.exists("Customer", customer):
+        customer_group = frappe.db.get_value("Customer", customer, "customer_group")
+        return _normalize_group(customer_group)
+
+    return None
+
+
+def _get_patient_panel_customer(patient_doc):
+    panel_value = _get_first_value(patient_doc, PATIENT_PANEL_FIELDS)
+
+    if not panel_value:
+        return None
+
+    return _find_customer_by_name_or_customer_name(panel_value)
+
+
+def _registration_doctype():
+    for doctype in WELFARE_REGISTRATION_DOCTYPES:
+        if frappe.db.exists("DocType", doctype):
+            return doctype
+
+    possible = frappe.get_all("DocType", pluck="name", limit_page_length=0)
+    for doctype in possible:
+        lowered = doctype.lower()
+        if "welfare" in lowered and ("registration" in lowered or "registeration" in lowered):
+            return doctype
+
+    return None
+
+
+def _registration_patient_fields(doctype):
+    meta = frappe.get_meta(doctype)
+    fields = []
+
+    for df in meta.fields:
+        if df.fieldtype == "Link" and df.options == "Patient":
+            fields.append(df.fieldname)
+
+    for fieldname in (
+        "patient",
+        "custom_patient",
+        "patient_id",
+        "custom_patient_id",
+        "patient_name",
+        "custom_patient_name",
+    ):
+        if meta.has_field(fieldname) and fieldname not in fields:
+            fields.append(fieldname)
+
+    return fields
+
+
+def _get_welfare_registration_status(patient):
+    doctype = _registration_doctype()
+
+    if not doctype:
+        return {
+            "status": "Not Submitted",
+            "status_code": "not_submitted",
+            "doctype": None,
+            "record": None,
+            "message": "No Welfare Registration Form DocType was found."
+        }
+
+    patient_fields = _registration_patient_fields(doctype)
+
+    if not patient_fields:
+        return {
+            "status": "Not Submitted",
+            "status_code": "not_submitted",
+            "doctype": doctype,
+            "record": None,
+            "message": f"No patient link field was found in {doctype}."
+        }
+
+    fields = ["name", "docstatus", "creation", "modified"]
+    meta = frappe.get_meta(doctype)
+
+    for fieldname in REGISTRATION_STATUS_FIELDS:
+        if meta.has_field(fieldname):
+            fields.append(fieldname)
+
+    records = []
+    seen = set()
+
+    for patient_field in patient_fields:
+        try:
+            rows = frappe.get_all(
+                doctype,
+                filters={patient_field: patient},
+                fields=fields,
+                order_by="modified desc",
+                limit_page_length=20,
+            )
+
+            for row in rows:
+                if row.name not in seen:
+                    seen.add(row.name)
+                    records.append(row)
+
+        except Exception:
+            continue
+
+    if not records:
+        return {
+            "status": "Not Submitted",
+            "status_code": "not_submitted",
+            "doctype": doctype,
+            "record": None,
+            "message": "No welfare registration form exists against this patient."
+        }
+
+    submitted_terms = {
+        "submitted",
+        "approved",
+        "active",
+        "completed",
+        "verified",
+    }
+
+    pending_terms = {
+        "draft",
+        "pending",
+        "open",
+        "in process",
+        "in-process",
+        "waiting",
+        "under review",
+    }
+
+    for row in records:
+        state_text = ""
+        for fieldname in REGISTRATION_STATUS_FIELDS:
+            if row.get(fieldname):
+                state_text = str(row.get(fieldname)).strip()
+                break
+
+        state_lower = state_text.lower()
+
+        if cint(row.docstatus) == 1 or state_lower in submitted_terms:
+            return {
+                "status": "Submitted",
+                "status_code": "submitted",
+                "doctype": doctype,
+                "record": row.name,
+                "message": f"Welfare registration is submitted: {row.name}"
+            }
+
+    for row in records:
+        state_text = ""
+        for fieldname in REGISTRATION_STATUS_FIELDS:
+            if row.get(fieldname):
+                state_text = str(row.get(fieldname)).strip()
+                break
+
+        state_lower = state_text.lower()
+
+        if cint(row.docstatus) == 0 or state_lower in pending_terms:
+            return {
+                "status": "Pending",
+                "status_code": "pending",
+                "doctype": doctype,
+                "record": row.name,
+                "message": f"Welfare registration exists but is not submitted: {row.name}"
+            }
+
+    latest = records[0]
+    return {
+        "status": "Not Submitted",
+        "status_code": "not_submitted",
+        "doctype": doctype,
+        "record": latest.name,
+        "message": f"Welfare registration is not in submitted status: {latest.name}"
+    }
+
+
+def _status_html(title, indicator, lines):
+    color = {
+        "green": "#16a34a",
+        "orange": "#f97316",
+        "red": "#dc2626",
+        "blue": "#2563eb",
+        "gray": "#64748b",
+    }.get(indicator, "#64748b")
+
+    line_html = "".join(
+        f"<div style='margin-top:4px'>{escape_html(str(line))}</div>"
+        for line in lines
+        if line
+    )
+
+    return f"""
+    <div style="
+        border: 1px solid {color};
+        border-left: 5px solid {color};
+        border-radius: 8px;
+        padding: 10px 12px;
+        margin: 8px 0;
+        background: #fff;
+    ">
+        <div style="font-weight: 700; color: {color}; margin-bottom: 4px;">
+            {escape_html(title)}
+        </div>
+        {line_html}
+    </div>
+    """
+
+
+@frappe.whitelist()
+def get_sales_invoice_patient_billing_status(patient, invoice_customer=None):
+    if not patient:
+        return {
+            "blocked": False,
+            "patient": None,
+            "group": None,
+            "indicator": "gray",
+            "title": "No Patient Selected",
+            "message": "Please select a patient.",
+            "html": ""
+        }
+
+    if not frappe.db.exists("Patient", patient):
+        return {
+            "blocked": True,
+            "patient": patient,
+            "group": None,
+            "indicator": "red",
+            "title": "Patient Not Found",
+            "message": f"Patient does not exist: {patient}",
+            "html": _status_html(
+                "Patient Not Found",
+                "red",
+                [f"Patient does not exist: {patient}"]
+            )
+        }
+
+    patient_doc = frappe.get_doc("Patient", patient)
+    group = _get_patient_group(patient_doc)
+
+    if not group:
+        return {
+            "blocked": True,
+            "patient": patient,
+            "group": None,
+            "indicator": "red",
+            "title": "Patient Billing Type Missing",
+            "message": "Patient Customer Group / Billing Type is not defined. Please ask Reception or Administrator to update the Patient first.",
+            "html": _status_html(
+                "Patient Billing Type Missing",
+                "red",
+                [
+                    f"Patient: {patient}",
+                    "Customer Group / Billing Type is not defined.",
+                    "Please ask Reception or Administrator to update the Patient first.",
+                ]
+            )
+        }
+
+    if group == "Cash":
+        return {
+            "blocked": False,
+            "patient": patient,
+            "group": group,
+            "indicator": "green",
+            "title": "Cash Patient",
+            "message": "Patient is marked as Cash. Billing can continue.",
+            "html": _status_html(
+                "Cash Patient",
+                "green",
+                [
+                    f"Patient: {patient}",
+                    "Billing Type: Cash",
+                    "Billing can continue.",
+                ]
+            )
+        }
+
+    if group == "Welfare":
+        welfare = _get_welfare_registration_status(patient)
+
+        if welfare["status_code"] == "submitted":
+            return {
+                "blocked": False,
+                "patient": patient,
+                "group": group,
+                "welfare_status": welfare["status"],
+                "welfare_doctype": welfare["doctype"],
+                "welfare_record": welfare["record"],
+                "indicator": "green",
+                "title": "Welfare Registration Submitted",
+                "message": welfare["message"],
+                "html": _status_html(
+                    "Welfare Registration Submitted",
+                    "green",
+                    [
+                        f"Patient: {patient}",
+                        "Billing Type: Welfare",
+                        f"Status: {welfare['status']}",
+                        f"Form: {welfare['record']}",
+                        "Billing can continue.",
+                    ]
+                )
+            }
+
+        if welfare["status_code"] == "pending":
+            title = "Welfare Registration Pending"
+            message = "Welfare registration exists but is not submitted. Please ask the Welfare/Reception department to submit it before billing."
+
+            return {
+                "blocked": True,
+                "patient": patient,
+                "group": group,
+                "welfare_status": welfare["status"],
+                "welfare_doctype": welfare["doctype"],
+                "welfare_record": welfare["record"],
+                "indicator": "orange",
+                "title": title,
+                "message": message,
+                "html": _status_html(
+                    title,
+                    "orange",
+                    [
+                        f"Patient: {patient}",
+                        "Billing Type: Welfare",
+                        f"Status: {welfare['status']}",
+                        f"Form: {welfare['record']}",
+                        "Please ask the Welfare/Reception department to submit the registration form first.",
+                    ]
+                )
+            }
+
+        title = "Welfare Registration Not Submitted"
+        message = "No submitted welfare registration form exists against this patient. Do not bill this patient as Cash. Please ask the Welfare/Reception department to complete the welfare registration first."
+
+        return {
+            "blocked": True,
+            "patient": patient,
+            "group": group,
+            "welfare_status": welfare["status"],
+            "welfare_doctype": welfare["doctype"],
+            "welfare_record": welfare["record"],
+            "indicator": "red",
+            "title": title,
+            "message": message,
+            "html": _status_html(
+                title,
+                "red",
+                [
+                    f"Patient: {patient}",
+                    "Billing Type: Welfare",
+                    f"Status: {welfare['status']}",
+                    "Do not bill this patient as Cash.",
+                    "Please ask the Welfare/Reception department to complete and submit the welfare registration first.",
+                ]
+            )
+        }
+
+    if group == "Panel":
+        panel_customer = _get_patient_panel_customer(patient_doc)
+
+        if not panel_customer:
+            title = "Panel Not Assigned"
+            message = "Panel is not assigned on this Patient. Please ask Reception or Administrator to assign the panel first."
+
+            return {
+                "blocked": True,
+                "patient": patient,
+                "group": group,
+                "panel_customer": None,
+                "indicator": "red",
+                "title": title,
+                "message": message,
+                "html": _status_html(
+                    title,
+                    "red",
+                    [
+                        f"Patient: {patient}",
+                        "Billing Type: Panel",
+                        "Panel is not assigned on this Patient.",
+                        "Please ask Reception or Administrator to assign the panel first.",
+                    ]
+                )
+            }
+
+        panel_flag = _panel_flag_field()
+
+        if not panel_flag:
+            title = "Panel Flag Missing"
+            message = "Customer field Is Panel was not found. Please ask Administrator to create/check the Is Panel field on Customer."
+
+            return {
+                "blocked": True,
+                "patient": patient,
+                "group": group,
+                "panel_customer": panel_customer.name,
+                "indicator": "red",
+                "title": title,
+                "message": message,
+                "html": _status_html(
+                    title,
+                    "red",
+                    [
+                        f"Patient: {patient}",
+                        f"Panel Customer: {panel_customer.name}",
+                        "Customer field Is Panel was not found.",
+                        "Please ask Administrator to fix the Customer setup.",
+                    ]
+                )
+            }
+
+        if not cint(panel_customer.get(panel_flag)):
+            title = "Assigned Customer Is Not Marked As Panel"
+            message = f"Assigned customer {panel_customer.name} is not marked as Is Panel. Please ask Administrator to correct the Customer master."
+
+            return {
+                "blocked": True,
+                "patient": patient,
+                "group": group,
+                "panel_customer": panel_customer.name,
+                "indicator": "red",
+                "title": title,
+                "message": message,
+                "html": _status_html(
+                    title,
+                    "red",
+                    [
+                        f"Patient: {patient}",
+                        f"Assigned Customer: {panel_customer.name}",
+                        "This customer is not marked as Is Panel.",
+                        "Please ask Administrator to correct the Customer master.",
+                    ]
+                )
+            }
+
+        if invoice_customer and invoice_customer != panel_customer.name:
+            title = "Wrong Customer Selected For Panel Patient"
+            message = f"This is a Panel patient. Sales Invoice Customer should be {panel_customer.name}, not {invoice_customer}."
+
+            return {
+                "blocked": True,
+                "patient": patient,
+                "group": group,
+                "panel_customer": panel_customer.name,
+                "invoice_customer": invoice_customer,
+                "indicator": "red",
+                "title": title,
+                "message": message,
+                "html": _status_html(
+                    title,
+                    "red",
+                    [
+                        f"Patient: {patient}",
+                        f"Assigned Panel Customer: {panel_customer.name}",
+                        f"Current Invoice Customer: {invoice_customer}",
+                        "Please select the assigned Panel Customer before saving/submitting.",
+                    ]
+                )
+            }
+
+        return {
+            "blocked": False,
+            "patient": patient,
+            "group": group,
+            "panel_customer": panel_customer.name,
+            "indicator": "green",
+            "title": "Panel Assigned",
+            "message": f"Panel is assigned correctly: {panel_customer.name}. Billing can continue.",
+            "html": _status_html(
+                "Panel Assigned",
+                "green",
+                [
+                    f"Patient: {patient}",
+                    "Billing Type: Panel",
+                    f"Assigned Panel Customer: {panel_customer.name}",
+                    "Billing can continue.",
+                ]
+            )
+        }
+
+    return {
+        "blocked": True,
+        "patient": patient,
+        "group": group,
+        "indicator": "red",
+        "title": "Invalid Patient Billing Type",
+        "message": f"Only Cash, Welfare, Panel and Personal Advance are allowed. Current value: {group}",
+        "html": _status_html(
+            "Invalid Patient Billing Type",
+            "red",
+            [
+                f"Patient: {patient}",
+                f"Current Billing Type: {group}",
+                "Only Cash, Welfare, Panel and Personal Advance are allowed.",
+                "Please ask Reception or Administrator to correct the Patient first.",
+            ]
+        )
+    }
+
+
+def _get_invoice_patient(doc):
+    for fieldname in INVOICE_PATIENT_FIELDS:
+        if _meta_has_field(doc.doctype, fieldname) and doc.get(fieldname):
+            return doc.get(fieldname)
+
+    return None
+
+
+def validate_sales_invoice_patient_billing_rules(doc, method=None):
+    patient = _get_invoice_patient(doc)
+
+    if not patient:
+        return
+
+    status = get_sales_invoice_patient_billing_status(
+        patient=patient,
+        invoice_customer=doc.get("customer")
+    )
+
+    if status.get("blocked"):
+        frappe.throw(
+            status.get("message"),
+            title=_("KPWS Patient Billing Control")
+        )
+
+
+CLIENT_SCRIPT = r"""
+const KPWS_SI_PATIENT_FIELDS = [
+    "patient",
+    "custom_patient",
+    "healthcare_patient",
+    "custom_healthcare_patient",
+    "patient_id",
+    "custom_patient_id"
+];
+
+function kpws_si_find_field(frm, fields) {
+    for (const fieldname of fields) {
+        if (frm.fields_dict[fieldname]) {
+            return fieldname;
+        }
+    }
+    return null;
+}
+
+function kpws_si_render_patient_status(frm, data) {
+    const html_field = "custom_kpws_patient_billing_status";
+
+    if (frm.fields_dict[html_field] && frm.fields_dict[html_field].$wrapper) {
+        frm.fields_dict[html_field].$wrapper.html(data && data.html ? data.html : "");
+    }
+
+    if (data && data.message) {
+        frm.set_intro(data.message, data.blocked ? "red" : "green");
+    }
+}
+
+function kpws_si_clear_patient_status(frm) {
+    const html_field = "custom_kpws_patient_billing_status";
+
+    if (frm.fields_dict[html_field] && frm.fields_dict[html_field].$wrapper) {
+        frm.fields_dict[html_field].$wrapper.html("");
+    }
+
+    frm.set_intro("");
+}
+
+function kpws_si_check_patient_status(frm, show_popup) {
+    const patient_field = kpws_si_find_field(frm, KPWS_SI_PATIENT_FIELDS);
+
+    if (!patient_field || !frm.doc[patient_field]) {
+        kpws_si_clear_patient_status(frm);
+        return;
+    }
+
+    frappe.call({
+        method: "kpws_customization.api.kpws_patient_invoice_control.get_sales_invoice_patient_billing_status",
+        args: {
+            patient: frm.doc[patient_field],
+            invoice_customer: frm.doc.customer || ""
+        },
+        freeze: false,
+        callback: function(r) {
+            const data = r.message || {};
+            kpws_si_render_patient_status(frm, data);
+
+            if (data.blocked && show_popup) {
+                frappe.msgprint({
+                    title: __("KPWS Patient Billing Control"),
+                    indicator: data.indicator || "red",
+                    message: data.html || data.message
+                });
+            }
+
+            if (!data.blocked && data.group === "Panel" && data.panel_customer && frm.doc.customer !== data.panel_customer) {
+                frm.add_custom_button(__("Set Assigned Panel Customer"), function() {
+                    frm.set_value("customer", data.panel_customer);
+                }, __("KPWS"));
+            }
+        }
+    });
+}
+
+frappe.ui.form.on("Sales Invoice", {
+    refresh(frm) {
+        if (!frm.is_new()) {
+            kpws_si_check_patient_status(frm, false);
+        }
+
+        frm.add_custom_button(__("Recheck Patient Billing Status"), function() {
+            kpws_si_check_patient_status(frm, true);
+        }, __("KPWS"));
+    },
+
+    patient(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    custom_patient(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    healthcare_patient(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    custom_healthcare_patient(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    patient_id(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    custom_patient_id(frm) {
+        kpws_si_check_patient_status(frm, true);
+    },
+
+    customer(frm) {
+        kpws_si_check_patient_status(frm, false);
+    }
+});
+"""
+
+
+def install_custom_field():
+    fieldname = "custom_kpws_patient_billing_status"
+
+    if frappe.db.exists("Custom Field", {"dt": "Sales Invoice", "fieldname": fieldname}):
+        return
+
+    insert_after = "customer"
+
+    for candidate in INVOICE_PATIENT_FIELDS:
+        if _meta_has_field("Sales Invoice", candidate):
+            insert_after = candidate
+            break
+
+    doc = frappe.get_doc({
+        "doctype": "Custom Field",
+        "dt": "Sales Invoice",
+        "label": "KPWS Patient Billing Status",
+        "fieldname": fieldname,
+        "fieldtype": "HTML",
+        "insert_after": insert_after,
+        "read_only": 1,
+        "no_copy": 1,
+    })
+    doc.insert(ignore_permissions=True)
+
+
+def install_client_script():
+    name = "KPWS Sales Invoice Patient Billing Control"
+
+    existing = frappe.db.exists("Client Script", name)
+
+    if existing:
+        doc = frappe.get_doc("Client Script", existing)
+    else:
+        doc = frappe.new_doc("Client Script")
+        doc.name = name
+        doc.dt = "Sales Invoice"
+
+    doc.dt = "Sales Invoice"
+    doc.script = CLIENT_SCRIPT
+
+    if doc.meta.has_field("view"):
+        doc.view = "Form"
+
+    if doc.meta.has_field("enabled"):
+        doc.enabled = 1
+
+    doc.save(ignore_permissions=True)
+
+
+@frappe.whitelist()
+def install():
+    install_custom_field()
+    install_client_script()
+    frappe.clear_cache(doctype="Sales Invoice")
+    frappe.db.commit()
+
+    return "KPWS Sales Invoice Patient Billing Control installed."
+
+
+def apply_panel_customer_to_sales_invoice(doc, method=None):
+    """
+    KPWS rule:
+    For Panel patients, the Sales Invoice Customer must be the assigned Panel Customer.
+    This makes the Panel Customer the actual bill-to / receivable party.
+    """
+    patient = _get_invoice_patient(doc)
+
+    if not patient:
+        return
+
+    if not frappe.db.exists("Patient", patient):
+        return
+
+    patient_doc = frappe.get_doc("Patient", patient)
+    group = _get_patient_group(patient_doc)
+
+    if group != "Panel":
+        return
+
+    panel_customer = _get_patient_panel_customer(patient_doc)
+
+    if not panel_customer:
+        frappe.throw(
+            _("Panel is not assigned on this Patient. Please ask Reception or Administrator to assign the panel first."),
+            title=_("KPWS Panel Billing Control")
+        )
+
+    panel_flag = _panel_flag_field()
+
+    if not panel_flag:
+        frappe.throw(
+            _("Customer field Is Panel was not found. Please ask Administrator to check the Customer master setup."),
+            title=_("KPWS Panel Billing Control")
+        )
+
+    if not cint(panel_customer.get(panel_flag)):
+        frappe.throw(
+            _("Assigned customer {0} is not marked as Is Panel. Please ask Administrator to correct the Customer master.").format(panel_customer.name),
+            title=_("KPWS Panel Billing Control")
+        )
+
+    # This is the actual bill-to party in ERPNext.
+    doc.customer = panel_customer.name
+
+
+# REVERTED_PANEL_BILL_TO_AUTO_SET_NOOP
+def apply_panel_customer_to_sales_invoice(doc, method=None):
+    """
+    Reverted:
+    Do not automatically change Sales Invoice Customer to Panel Customer.
+    The UI/status control may still warn users, but it will not auto-set customer.
+    """
+    return
+
+
+# KPWS_FINAL_PERSONAL_ADVANCE_INVOICE_CONTROL_OVERRIDE_V72
+# This override fixes false rejection:
+# "Only Cash, Welfare, Panel and Personal Advance are allowed. Current value: Personal Advance"
+
+try:
+    _kpws_original_validate_sales_invoice_patient_billing_rules = validate_sales_invoice_patient_billing_rules
+except Exception:
+    _kpws_original_validate_sales_invoice_patient_billing_rules = None
+
+
+def _kpws_v72_get_patient_type_from_invoice(doc):
+    import frappe
+
+    patient = (
+        doc.get("patient")
+        or doc.get("custom_patient")
+        or doc.get("custom_kpws_patient")
+    )
+
+    if patient and frappe.db.exists("Patient", patient):
+        return frappe.db.get_value("Patient", patient, "customer_group")
+
+    # fallback custom marker
+    for fieldname in [
+        "custom_kpws_patient_billing_group",
+        "custom_patient_billing_group",
+        "custom_billing_group",
+    ]:
+        if doc.meta.has_field(fieldname) and doc.get(fieldname):
+            return doc.get(fieldname)
+
+    # fallback from customer
+    if doc.get("customer") and frappe.db.exists("Customer", doc.customer):
+        return frappe.db.get_value("Customer", doc.customer, "customer_group")
+
+    return None
+
+
+def _kpws_v72_get_patient_customer_from_invoice(doc):
+    import frappe
+
+    patient = (
+        doc.get("patient")
+        or doc.get("custom_patient")
+        or doc.get("custom_kpws_patient")
+    )
+
+    if patient and frappe.db.exists("Patient", patient):
+        return frappe.db.get_value("Patient", patient, "customer")
+
+    return None
+
+
+def _kpws_v72_customer_receivable(customer, company):
+    import frappe
+
+    company = company or "Kiran Patient Welfare Society"
+
+    if customer and frappe.db.exists("Customer", customer):
+        try:
+            c = frappe.get_doc("Customer", customer)
+            for row in c.get("accounts") or []:
+                if row.company == company and row.account:
+                    return row.account
+        except Exception:
+            pass
+
+    return (
+        frappe.db.get_value("Company", company, "default_receivable_account")
+        or frappe.db.get_value(
+            "Account",
+            {
+                "company": company,
+                "account_type": "Receivable",
+                "is_group": 0,
+            },
+            "name",
+        )
+    )
+
+
+def validate_sales_invoice_patient_billing_rules(doc, method=None):
+    """
+    Final validator override.
+
+    Personal Advance is a valid patient type.
+    It must not be blocked by old Cash/Welfare/Panel-only logic.
+    """
+    import frappe
+
+    patient_type = _kpws_v72_get_patient_type_from_invoice(doc)
+
+    # Normalize
+    patient_type = (patient_type or "").strip()
+
+    if patient_type == "Personal Advance":
+        customer = _kpws_v72_get_patient_customer_from_invoice(doc)
+
+        if not customer or not frappe.db.exists("Customer", customer):
+            frappe.throw(
+                "Personal Advance patient must have a linked Customer before billing. "
+                "Please receive Personal Advance from Accounts first."
+            )
+
+        # Force the correct customer and non-POS behavior.
+        doc.customer = customer
+        doc.customer_name = frappe.db.get_value("Customer", customer, "customer_name") or customer
+
+        receivable = _kpws_v72_customer_receivable(customer, doc.get("company"))
+        if receivable:
+            doc.debit_to = receivable
+
+        doc.is_pos = 0
+        doc.pos_profile = None
+        doc.set("payments", [])
+
+        for fieldname in [
+            "paid_amount",
+            "base_paid_amount",
+            "change_amount",
+            "base_change_amount",
+            "write_off_amount",
+            "base_write_off_amount",
+        ]:
+            if doc.meta.has_field(fieldname):
+                doc.set(fieldname, 0)
+
+        if doc.meta.has_field("custom_kpws_patient_billing_group"):
+            doc.custom_kpws_patient_billing_group = "Personal Advance"
+
+        return
+
+    # For normal old types, keep old validator.
+    if _kpws_original_validate_sales_invoice_patient_billing_rules:
+        return _kpws_original_validate_sales_invoice_patient_billing_rules(doc, method)
+
+    return

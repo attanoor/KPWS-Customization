@@ -1,0 +1,241 @@
+/* KPWS Step 1 - Welfare Registration Review Flow */
+(function () {
+    const ADMIN_ROLES = ["Administrator", "System Manager", "Healthcare Manager", "Welfare Manager"];
+    const PANEL_FIELD = "custom_kpws_assigned_panel_customer";
+
+    function is_admin_user() {
+        if (frappe.session.user === "Administrator") return true;
+
+        const roles = frappe.user_roles || [];
+        return ADMIN_ROLES.some(role => roles.includes(role));
+    }
+
+    function has_field(frm, fieldname) {
+        return frm.fields_dict && frm.fields_dict[fieldname];
+    }
+
+    function set_panel_query(frm) {
+        [PANEL_FIELD, "custom_assigned_panel", "custom_panel_customer", "custom_panel"].forEach(function (fieldname) {
+            if (!has_field(frm, fieldname)) return;
+
+            frm.set_query(fieldname, function () {
+                return {
+                    query: "kpws_customization.api.kpws_step1_patient_welfare.get_panel_customers"
+                };
+            });
+        });
+    }
+
+    function set_read_only(frm, fieldnames, value) {
+        fieldnames.forEach(function (fieldname) {
+            if (has_field(frm, fieldname)) {
+                frm.set_df_property(fieldname, "read_only", value ? 1 : 0);
+            }
+        });
+    }
+
+    function apply_permissions(frm) {
+        const admin = is_admin_user();
+
+        const auto_fields = [
+            "patient_name",
+            "custom_patient",
+            "mr_no",
+            "custom_mr_number",
+            "patient_full_name",
+            "actual_patient_name",
+            "custom_patient_customer",
+            "customer",
+            "custom_billing_type"
+        ];
+
+        const admin_review_fields = [
+            "discount_type",
+            "discount_value",
+            "purpose",
+            PANEL_FIELD,
+            "custom_assigned_panel",
+            "custom_panel_customer",
+            "custom_panel",
+            "custom_kpws_admin_notes"
+        ];
+
+        const admin_contact_fields = [
+            "cnic",
+            "swo",
+            "religion1",
+            "saction1",
+            "nationality",
+            "address",
+            "contact_no"
+        ];
+
+        set_read_only(frm, auto_fields, true);
+        set_read_only(frm, admin_review_fields, !admin);
+        set_read_only(frm, admin_contact_fields, !admin);
+
+        if (has_field(frm, "workflow_state")) {
+            frm.set_df_property("workflow_state", "read_only", 1);
+        }
+    }
+
+    function submit_for_review(frm) {
+        if (frm.is_new()) {
+            frappe.msgprint(__("Please save the form first."));
+            return;
+        }
+
+        frappe.call({
+            method: "kpws_customization.api.kpws_step1_patient_welfare.submit_welfare_for_review",
+            args: {
+                prf_name: frm.doc.name
+            },
+            freeze: true,
+            freeze_message: __("Submitting for Administrator Review..."),
+            callback: function () {
+                frappe.show_alert({
+                    message: __("Submitted for Administrator Review."),
+                    indicator: "green"
+                });
+                frm.reload_doc();
+            }
+        });
+    }
+
+    function approve_welfare(frm) {
+        if (frm.is_new()) {
+            frappe.msgprint(__("Please save the form first."));
+            return;
+        }
+
+        frappe.confirm(
+            __("Approve this Welfare Registration and update Patient welfare details?"),
+            function () {
+                frappe.call({
+                    method: "kpws_customization.api.kpws_step1_patient_welfare.approve_welfare_registration",
+                    args: {
+                        prf_name: frm.doc.name
+                    },
+                    freeze: true,
+                    freeze_message: __("Approving Welfare Registration..."),
+                    callback: function () {
+                        frappe.show_alert({
+                            message: __("Welfare Registration approved."),
+                            indicator: "green"
+                        });
+                        frm.reload_doc();
+                    }
+                });
+            }
+        );
+    }
+
+    function create_panel_dialog(frm) {
+        const dialog = new frappe.ui.Dialog({
+            title: __("Create New Panel"),
+            fields: [
+                {
+                    fieldname: "panel_name",
+                    label: __("Panel Name"),
+                    fieldtype: "Data",
+                    reqd: 1
+                },
+                {
+                    fieldname: "contact_person",
+                    label: __("Contact Person"),
+                    fieldtype: "Data"
+                },
+                {
+                    fieldname: "phone",
+                    label: __("Phone"),
+                    fieldtype: "Data"
+                },
+                {
+                    fieldname: "email",
+                    label: __("Email"),
+                    fieldtype: "Data",
+                    options: "Email"
+                },
+                {
+                    fieldname: "default_mode_of_payment",
+                    label: __("Default Mode of Payment"),
+                    fieldtype: "Link",
+                    options: "Mode of Payment"
+                }
+            ],
+            primary_action_label: __("Create Panel"),
+            primary_action(values) {
+                frappe.call({
+                    method: "kpws_customization.api.kpws_step1_patient_welfare.create_panel_from_welfare_form",
+                    args: values,
+                    freeze: true,
+                    freeze_message: __("Creating Panel..."),
+                    callback: function (r) {
+                        if (r.message && r.message.customer) {
+                            if (has_field(frm, PANEL_FIELD)) {
+                                frm.set_value(PANEL_FIELD, r.message.customer);
+                            } else if (has_field(frm, "custom_assigned_panel")) {
+                                frm.set_value("custom_assigned_panel", r.message.customer);
+                            } else if (has_field(frm, "custom_panel_customer")) {
+                                frm.set_value("custom_panel_customer", r.message.customer);
+                            }
+
+                            frappe.show_alert({
+                                message: __("Panel created and selected."),
+                                indicator: "green"
+                            });
+                        }
+                        dialog.hide();
+                    }
+                });
+            }
+        });
+
+        dialog.show();
+    }
+
+    function add_buttons(frm) {
+        if (frm.is_new()) return;
+
+        const admin = is_admin_user();
+
+        if (!admin && frm.doc.workflow_state !== "Pending Admin" && frm.doc.workflow_state !== "Approved") {
+            frm.add_custom_button(__("Submit for Administrator Review"), function () {
+                submit_for_review(frm);
+            }, __("KPWS"));
+        }
+
+        if (admin) {
+            frm.add_custom_button(__("Approve Welfare Registration"), function () {
+                approve_welfare(frm);
+            }, __("KPWS"));
+
+            frm.add_custom_button(__("Create New Panel"), function () {
+                create_panel_dialog(frm);
+            }, __("KPWS"));
+        }
+
+        if (frm.doc.patient_name) {
+            frm.add_custom_button(__("Open Patient"), function () {
+                frappe.set_route("Form", "Patient", frm.doc.patient_name);
+            }, __("KPWS"));
+        }
+    }
+
+    frappe.ui.form.on("Patient Registration Form", {
+        setup: function (frm) {
+            set_panel_query(frm);
+        },
+
+        onload: function (frm) {
+            set_panel_query(frm);
+            apply_permissions(frm);
+        },
+
+        refresh: function (frm) {
+            set_panel_query(frm);
+            apply_permissions(frm);
+            add_buttons(frm);
+        }
+    });
+})();

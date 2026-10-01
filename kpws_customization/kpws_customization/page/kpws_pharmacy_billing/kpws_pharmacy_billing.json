@@ -1,0 +1,30 @@
+{
+ "content": null,
+ "creation": "2026-05-17 18:09:43.012660",
+ "docstatus": 0,
+ "doctype": "Page",
+ "icon": "octicon octicon-credit-card",
+ "idx": 0,
+ "modified": "2026-05-18 11:48:32.644607",
+ "modified_by": "Administrator",
+ "module": "Kpws Customization",
+ "name": "kpws-pharmacy-billing",
+ "owner": "Administrator",
+ "page_name": "kpws-pharmacy-billing",
+ "roles": [
+  {
+   "role": "KPWS Pharmacy User"
+  },
+  {
+   "role": "Phamarcy Manager"
+  },
+  {
+   "role": "Phamarcy Manager"
+  }
+ ],
+ "script": null,
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "KPWS Pharmacy Billing"
+}

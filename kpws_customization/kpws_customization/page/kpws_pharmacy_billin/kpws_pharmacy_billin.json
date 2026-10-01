@@ -1,0 +1,32 @@
+{
+ "content": null,
+ "creation": "2026-05-17 18:01:35.928885",
+ "docstatus": 0,
+ "doctype": "Page",
+ "idx": 0,
+ "modified": "2026-05-17 18:01:35.928885",
+ "modified_by": "Administrator",
+ "module": "Kpws Customization",
+ "name": "kpws-pharmacy-billin",
+ "owner": "Administrator",
+ "page_name": "kpws-pharmacy-billin",
+ "roles": [
+  {
+   "role": "System Manager"
+  },
+  {
+   "role": "Accounts Manager"
+  },
+  {
+   "role": "Sales User"
+  },
+  {
+   "role": "KPWS Pharmacy User"
+  }
+ ],
+ "script": null,
+ "standard": "Yes",
+ "style": null,
+ "system_page": 0,
+ "title": "KPWS Pharmacy Billing"
+}

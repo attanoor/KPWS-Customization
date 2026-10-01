@@ -1,0 +1,646 @@
+frappe.pages['kpws-patient-intake'].on_page_load = function(wrapper) {
+    new KPWSPatientIntake(wrapper);
+};
+
+class KPWSPatientIntake {
+    constructor(wrapper) {
+        this.wrapper = wrapper;
+        this.page = frappe.ui.make_app_page({
+            parent: wrapper,
+            title: 'KPWS Patient Intake',
+            single_column: true
+        });
+
+        this.patient = null;
+        this.render();
+        this.bind_events();
+        if (typeof this.load_panel_customers === 'function') { this.load_panel_customers(); }
+    }
+
+    render() {
+        const html = `
+            <style>
+                .kpws-intake-wrap {
+                    padding: 16px;
+                    background: #f7f8fa;
+                    min-height: calc(100vh - 120px);
+                }
+                .kpws-card {
+                    background: #fff;
+                    border: 1px solid #e5e7eb;
+                    border-radius: 14px;
+                    padding: 16px;
+                    margin-bottom: 14px;
+                    box-shadow: 0 2px 8px rgba(0,0,0,.04);
+                }
+                .kpws-title {
+                    font-size: 18px;
+                    font-weight: 700;
+                    margin-bottom: 12px;
+                    color: #111827;
+                }
+                .kpws-grid {
+                    display: grid;
+                    grid-template-columns: repeat(4, minmax(160px, 1fr));
+                    gap: 12px;
+                }
+                .kpws-grid-3 {
+                    display: grid;
+                    grid-template-columns: repeat(3, minmax(180px, 1fr));
+                    gap: 12px;
+                }
+                .kpws-field label {
+                    display:block;
+                    font-weight:600;
+                    color:#374151;
+                    margin-bottom:5px;
+                    font-size:12px;
+                }
+                .kpws-field input,
+                .kpws-field select,
+                .kpws-field textarea {
+                    width:100%;
+                    border:1px solid #d1d5db;
+                    border-radius:8px;
+                    padding:8px 10px;
+                    background:#fff;
+                    min-height:36px;
+                }
+                .kpws-field textarea {
+                    min-height:70px;
+                }
+                .kpws-actions {
+                    display:flex;
+                    gap:10px;
+                    flex-wrap:wrap;
+                    margin-top: 12px;
+                }
+                .kpws-badge {
+                    display:inline-block;
+                    padding:5px 10px;
+                    border-radius:999px;
+                    background:#eef2ff;
+                    color:#3730a3;
+                    font-weight:600;
+                    margin-right:6px;
+                    margin-bottom:6px;
+                }
+                .kpws-warning {
+                    background:#fff7ed;
+                    color:#9a3412;
+                    border:1px solid #fed7aa;
+                    padding:10px;
+                    border-radius:10px;
+                    margin-top:10px;
+                }
+                .hidden {
+                    display:none !important;
+                }
+                @media (max-width: 1100px) {
+                    .kpws-grid, .kpws-grid-3 {
+                        grid-template-columns: repeat(2, minmax(160px, 1fr));
+                    }
+                }
+                @media (max-width: 700px) {
+                    .kpws-grid, .kpws-grid-3 {
+                        grid-template-columns: 1fr;
+                    }
+                }
+            </style>
+
+            <div class="kpws-intake-wrap">
+                <div class="kpws-card">
+                    <div class="kpws-title">Search Patient</div>
+                    <div class="kpws-grid-3">
+                        <div class="kpws-field">
+                            <label>Search by CNIC / MR No / Name</label>
+                            <input type="text" id="kpws_search" placeholder="Enter CNIC, MR No, or Name">
+                        </div>
+                        <div class="kpws-field">
+                            <label>&nbsp;</label>
+                            <button class="btn btn-primary" id="kpws_search_btn">Search</button>
+                            <button class="btn btn-default" id="kpws_clear_btn">New Patient</button>
+                        </div>
+                        <div class="kpws-field">
+                            <label>Current Patient</label>
+                            <div id="kpws_current_patient">
+                                <span class="kpws-badge">New Patient</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div id="kpws_search_results"></div>
+                </div>
+
+                <div class="kpws-card">
+                    <div class="kpws-title">Patient Information</div>
+                    <div class="kpws-grid">
+                        <div class="kpws-field">
+                            <label>First Name *</label>
+                            <input type="text" id="first_name">
+                        </div>
+                        <div class="kpws-field">
+                            <label>Last Name</label>
+                            <input type="text" id="last_name">
+                        </div>
+                        <div class="kpws-field">
+                            <label>CNIC *</label>
+                            <input type="text" id="cnic" placeholder="42101-1234567-1">
+                        </div>
+                        <div class="kpws-field">
+                            <label>MR Number</label>
+                            <input type="text" id="mr_number">
+                        </div>
+
+                        <div class="kpws-field">
+                            <label>Age *</label>
+                            <input type="number" id="age" min="0">
+                        </div>
+                        <div class="kpws-field">
+                            <label>Gender</label>
+                            <select id="gender">
+                                <option value=""></option>
+                                <option value="Male">Male</option>
+                                <option value="Female">Female</option>
+                                <option value="Other">Other</option>
+                            </select>
+                        </div>
+                        <div class="kpws-field">
+                            <label>Mobile No</label>
+                            <input type="text" id="mobile_no">
+                        </div>
+                        <div class="kpws-field">
+                            <label>Patient Status</label>
+                            <select id="patient_status">
+                                <option value="SE">SE</option>
+                                <option value="E">E</option>
+                                <option value="NE">NE</option>
+                                <option value="P">P</option>
+                            </select>
+                        </div>
+                    </div>
+
+                    <div class="kpws-field" style="margin-top:12px;">
+                        <label>Patient Details / Notes</label>
+                        <textarea id="patient_details"></textarea>
+                    </div>
+                </div>
+
+                <div class="kpws-card">
+                    <div class="kpws-title">Registration Classification</div>
+                    <div class="kpws-grid">
+                        <div class="kpws-field">
+                            <label>Patient Type *</label>
+                            <select id="patient_type">
+                                <option value="Cash">Cash</option>
+                                <option value="Welfare">Welfare</option>
+                                <option value="Panel">Panel</option>
+                                <option value="Personal Advance">Personal Advance</option>
+                            </select>
+                        </div>
+
+                        <div class="kpws-field" id="funding_source_wrap">
+                            <label>Funding Source *</label>
+                            <select id="funding_source">
+                                <option value="">Select</option>
+                                <option value="Zakat">Zakat</option>
+                                <option value="Donation">Donation</option>
+                                <option value="Panel">Panel</option>
+                            </select>
+                        </div>
+
+                        <div class="kpws-field" id="panel_customer_wrap">
+                            <label>Panel Name *</label>
+                            <select id="panel_customer"><option value="">Loading Panels...</option></select>
+                        </div>
+
+                        <div class="kpws-field" id="percentage_wrap">
+                            <label>Approved Percentage</label>
+                            <input type="number" id="approved_percentage" min="0" max="100" value="100">
+                        </div>
+                    </div>
+
+                    <div id="kpws_decision" class="kpws-warning"></div>
+
+                    <div class="kpws-actions">
+                        <button class="btn btn-primary" id="save_patient_btn">Save Patient</button>
+                        <button class="btn btn-default" id="create_token_btn">Create Token</button>
+                        <button class="btn btn-warning" id="send_approval_btn">Send for Welfare Approval</button>
+                        <button class="btn btn-default" id="open_prf_btn">Open Welfare Registration</button>
+                        <button class="btn btn-success" id="open_billing_btn">Open Pharmacy Billing</button>
+                    </div>
+                </div>
+
+                <div class="kpws-card">
+                    <div class="kpws-title">Welfare Registration Status</div>
+                    <div id="welfare_status">
+                        <span class="kpws-badge">No registration loaded</span>
+                    </div>
+                </div>
+            </div>
+        `;
+
+        $(this.page.body).html(html);
+        this.update_visibility();
+        this.update_decision();
+    }
+
+    bind_events() {
+        const me = this;
+
+        $(this.page.body).on('change keyup', '#patient_type, #funding_source, #panel_customer, #approved_percentage', function() {
+            me.update_visibility();
+            me.update_decision();
+        });
+
+        $(this.page.body).on('click', '#kpws_clear_btn', function() {
+            me.patient = null;
+            me.clear_form();
+            me.update_patient_badge();
+            me.update_visibility();
+            me.update_decision();
+        });
+
+        $(this.page.body).on('click', '#save_patient_btn', function() {
+            me.save_patient();
+        });
+
+        $(this.page.body).on('click', '#create_token_btn', function() {
+            me.create_token();
+        });
+
+        $(this.page.body).on('click', '#send_approval_btn', function() {
+            me.send_for_approval();
+        });
+
+        $(this.page.body).on('click', '#open_prf_btn', function() {
+            me.open_prf();
+        });
+
+        $(this.page.body).on('click', '#open_billing_btn', function() {
+            me.open_billing();
+        });
+
+        $(this.page.body).on('click', '#kpws_search_btn', function() {
+            me.search_patient();
+        });
+    }
+
+    get_value(id) {
+        return ($(this.page.body).find('#' + id).val() || '').trim();
+    }
+
+    set_value(id, value) {
+        $(this.page.body).find('#' + id).val(value || '');
+    }
+
+    clear_form() {
+        [
+            'first_name', 'last_name', 'cnic', 'mr_number', 'age', 'gender',
+            'mobile_no', 'patient_details', 'funding_source', 'panel_customer'
+        ].forEach(id => this.set_value(id, ''));
+
+        this.set_value('patient_status', 'SE');
+        this.set_value('patient_type', 'Cash');
+        this.set_value('approved_percentage', '100');
+        $('#welfare_status').html('<span class="kpws-badge">No registration loaded</span>');
+    }
+
+    update_patient_badge() {
+        if (this.patient) {
+            $('#kpws_current_patient').html(`<span class="kpws-badge">${frappe.utils.escape_html(this.patient)}</span>`);
+        } else {
+            $('#kpws_current_patient').html('<span class="kpws-badge">New Patient</span>');
+        }
+    }
+
+    update_visibility() {
+        const patient_type = this.get_value('patient_type');
+        const funding_source = this.get_value('funding_source');
+
+        $('#funding_source_wrap').toggleClass('hidden', patient_type !== 'Welfare');
+        $('#percentage_wrap').toggleClass('hidden', patient_type !== 'Welfare');
+
+        const show_panel = patient_type === 'Panel' || (patient_type === 'Welfare' && funding_source === 'Panel');
+        $('#panel_customer_wrap').toggleClass('hidden', !show_panel);
+
+        if (patient_type === 'Cash') {
+            this.set_value('funding_source', '');
+            this.set_value('panel_customer', '');
+        }
+
+        if (patient_type === 'Panel') {
+            this.set_value('funding_source', '');
+        }
+    }
+
+    update_decision() {
+        const patient_type = this.get_value('patient_type');
+        const funding_source = this.get_value('funding_source');
+        const panel_customer = this.get_value('panel_customer');
+        const percent = this.get_value('approved_percentage') || 100;
+
+        let msg = '';
+
+        if (patient_type === 'Cash') {
+            msg = 'Cash patient: no funding source required. Pharmacy billing will use Cash/Card POS payment.';
+        } else if (patient_type === 'Welfare') {
+            if (!funding_source) {
+                msg = 'Welfare patient: select Funding Source: Zakat, Donation, or Panel.';
+            } else if (funding_source === 'Panel') {
+                msg = `Welfare Panel: panel customer is required. Billing will be non-POS and receivable from panel${panel_customer ? ': ' + panel_customer : ''}.`;
+            } else {
+                msg = `Welfare ${funding_source}: ${percent}% covered by ${funding_source}. Remaining share can be collected by Cash/Card.`;
+            }
+        } else if (patient_type === 'Panel') {
+            msg = `Panel patient: panel name is required. Billing will be non-POS and outstanding until panel pays${panel_customer ? ': ' + panel_customer : ''}.`;
+        } else if (patient_type === 'Personal Advance') {
+            msg = 'Personal Advance patient: pharmacy will show available advance balance and use it before cash/card collection.';
+        }
+
+        $('#kpws_decision').html(msg);
+    }
+
+    validate_form() {
+        const first_name = this.get_value('first_name');
+        const cnic = this.get_value('cnic');
+        const age = this.get_value('age');
+        const patient_type = this.get_value('patient_type');
+        const funding_source = this.get_value('funding_source');
+        const panel_customer = this.get_value('panel_customer');
+
+        if (!first_name) {
+            frappe.throw('First Name is required.');
+        }
+
+        if (!cnic) {
+            frappe.throw('CNIC is required.');
+        }
+
+        if (!age) {
+            frappe.throw('Age is required.');
+        }
+
+        if (!patient_type) {
+            frappe.throw('Patient Type is required.');
+        }
+
+        if (patient_type === 'Welfare' && !funding_source) {
+            frappe.throw('Funding Source is required for Welfare patient.');
+        }
+
+        if ((patient_type === 'Panel' || (patient_type === 'Welfare' && funding_source === 'Panel')) && !panel_customer) {
+            frappe.throw('Panel Name is required.');
+        }
+    }
+
+    get_payload() {
+        const first = this.get_value('first_name');
+        const last = this.get_value('last_name');
+        const full_name = [first, last].filter(Boolean).join(' ');
+
+        return {
+            name: this.patient,
+            first_name: first,
+            last_name: last,
+            patient_name: full_name,
+            cnic: this.get_value('cnic'),
+            custom_kpws_cnic: this.get_value('cnic'),
+            age: this.get_value('age'),
+            age_: this.get_value('age'),
+            gender: this.get_value('gender'),
+            sex: this.get_value('gender'),
+            mobile_no: this.get_value('mobile_no'),
+            custom_reference_number: this.get_value('mr_number'),
+            mr_number: this.get_value('mr_number'),
+            patient_status: this.get_value('patient_status') || 'SE',
+            customer_group: this.get_value('patient_type'),
+            custom_kpws_funding_source: this.get_value('funding_source'),
+            funding_source: this.get_value('funding_source'),
+            custom_panel_customer: this.get_value('panel_customer'),
+            panel_customer: this.get_value('panel_customer'),
+            patient_details: this.get_value('patient_details')
+        };
+    }
+
+    save_patient() {
+        this.validate_form();
+
+        const me = this;
+        const payload = this.get_payload();
+
+        frappe.call({
+            method: 'kpws_customization.api.kpws_patient_intake_v52.save_patient',
+            args: {
+                payload: JSON.stringify(payload)
+            },
+            freeze: true,
+            freeze_message: 'Saving Patient...',
+            callback: function(r) {
+                if (r.message) {
+                    me.patient = r.message.patient || r.message.name || me.patient;
+                    me.update_patient_badge();
+                    frappe.show_alert({message: 'Patient saved successfully', indicator: 'green'});
+                    me.refresh_context();
+                }
+            }
+        });
+    }
+
+    search_patient() {
+        const q = this.get_value('kpws_search');
+        if (!q) {
+            frappe.msgprint('Enter CNIC, MR Number, or Patient Name to search.');
+            return;
+        }
+
+        frappe.call({
+            method: 'kpws_customization.api.kpws_patient_intake_v52.search_patients',
+            args: { query: q },
+            callback: (r) => {
+                const rows = r.message || [];
+                if (!rows.length) {
+                    $('#kpws_search_results').html('<div class="kpws-warning">No patient found by Patient ID. Use New Patient or search manually from Patient list.</div>');
+                    return;
+                }
+
+                let html = '<div style="margin-top:12px;">';
+                rows.forEach(row => {
+                    html += `<button class="btn btn-xs btn-default kpws-pick-patient" data-name="${row.name}">
+                        ${row.name} - ${frappe.utils.escape_html(row.patient_name || '')} - ${frappe.utils.escape_html(row.custom_reference_number || '')}
+                    </button> `;
+                });
+                html += '</div>';
+                $('#kpws_search_results').html(html);
+
+                $('.kpws-pick-patient').off('click').on('click', (e) => {
+                    const name = $(e.currentTarget).data('name');
+                    this.load_patient(name);
+                });
+            }
+        });
+    }
+
+    load_patient(name) {
+        frappe.call({
+            method: 'frappe.client.get',
+            args: {
+                doctype: 'Patient',
+                name: name
+            },
+            freeze: true,
+            callback: (r) => {
+                const d = r.message;
+                if (!d) return;
+
+                this.patient = d.name;
+                this.set_value('first_name', d.first_name || '');
+                this.set_value('last_name', d.last_name || '');
+                this.set_value('cnic', d.custom_kpws_cnic || d.cnic || '');
+                this.set_value('age', d.age_ || d.age || '');
+                this.set_value('gender', d.sex || d.gender || '');
+                this.set_value('mobile_no', d.mobile || d.mobile_no || d.custom_kpws_mobile_no || '');
+                this.set_value('mr_number', d.custom_reference_number || '');
+                this.set_value('patient_status', d.patient_status || 'SE');
+                this.set_value('patient_type', d.customer_group || 'Cash');
+                this.set_value('funding_source', d.custom_kpws_funding_source || '');
+                this.set_value('panel_customer', d.custom_panel_customer || '');
+                this.set_value('patient_details', d.patient_details || '');
+
+                this.update_patient_badge();
+                this.update_visibility();
+                this.update_decision();
+                this.refresh_context();
+            }
+        });
+    }
+
+    refresh_context() {
+        if (!this.patient) return;
+
+        $('#welfare_status').html('<span class="kpws-badge">Checking status...</span>');
+
+        frappe.call({
+            method: 'kpws_customization.api.kpws_patient_intake_v52.get_patient_context',
+            args: { patient: this.patient },
+            callback: (r) => {
+                const ctx = r.message || {};
+                const reg = ctx.welfare_registration;
+                const token = ctx.latest_token;
+
+                let html = '';
+
+                if (reg) {
+                    this.latest_prf = reg.name;
+                    html += `<span class="kpws-badge">PRF: ${reg.name}</span>`;
+                    html += `<span class="kpws-badge">Status: ${reg.workflow_state || (reg.docstatus === 1 ? 'Submitted' : 'Draft')}</span>`;
+                    html += `<span class="kpws-badge">Purpose: ${reg.purpose || ''}</span>`;
+                    html += `<span class="kpws-badge">Percentage: ${reg.percentage || 0}%</span>`;
+                } else {
+                    html += '<span class="kpws-badge">No Welfare Registration</span>';
+                }
+
+                if (token) {
+                    html += `<span class="kpws-badge">Latest Token: ${token.name}</span>`;
+                }
+
+                $('#welfare_status').html(html);
+                this.update_decision();
+            }
+        });
+    }
+
+    create_token() {
+        if (!this.patient) {
+            frappe.msgprint('Save the patient first, then create token.');
+            return;
+        }
+
+        frappe.call({
+            method: 'kpws_customization.api.kpws_patient_intake_v52.create_token',
+            args: { patient: this.patient },
+            freeze: true,
+            freeze_message: 'Creating Token...',
+            callback: (r) => {
+                if (r.message && r.message.token) {
+                    frappe.show_alert({message: 'Token created: ' + r.message.token, indicator: 'green'});
+                    this.refresh_context();
+                }
+            }
+        });
+    }
+
+    send_for_approval() {
+        if (!this.patient) {
+            frappe.msgprint('Save the patient first.');
+            return;
+        }
+
+        frappe.call({
+            method: 'kpws_customization.api.kpws_patient_intake_v52.create_or_update_registration',
+            args: {
+                patient: this.patient,
+                funding_source: this.get_value('funding_source'),
+                percentage: this.get_value('approved_percentage') || 100,
+                panel_customer: this.get_value('panel_customer')
+            },
+            freeze: true,
+            freeze_message: 'Creating Welfare Registration...',
+            callback: (r) => {
+                frappe.show_alert({message: 'Welfare registration created/updated', indicator: 'green'});
+                this.refresh_context();
+            }
+        });
+    }
+
+    open_prf() {
+        if (this.latest_prf) {
+            frappe.set_route('Form', 'Patient Registration Form', this.latest_prf);
+        } else {
+            frappe.msgprint('No Welfare Registration found for this patient.');
+        }
+    }
+
+    open_billing() {
+        frappe.set_route('kpws-pharmacy-billing');
+    }
+}
+
+
+
+// KPWS_PANEL_CUSTOMER_DROPDOWN_FIX_V58
+KPWSPatientIntake.prototype.load_panel_customers = function() {
+    const me = this;
+    const $select = $(me.page.body).find('#panel_customer');
+
+    if (!$select.length) {
+        return;
+    }
+
+    const current = $select.val() || '';
+
+    $select.html('<option value="">Loading Panels...</option>');
+
+    frappe.call({
+        method: 'kpws_customization.api.kpws_patient_intake_v52.get_panel_customers',
+        args: {},
+        callback: function(r) {
+            const rows = r.message || [];
+            let html = '<option value="">Select Panel</option>';
+
+            rows.forEach(function(row) {
+                const value = frappe.utils.escape_html(row.value || '');
+                const label = frappe.utils.escape_html(row.label || row.value || '');
+                html += `<option value="${value}">${label}</option>`;
+            });
+
+            $select.html(html);
+
+            if (current) {
+                $select.val(current);
+            }
+        },
+        error: function() {
+            $select.html('<option value="">No panels loaded</option>');
+        }
+    });
+};

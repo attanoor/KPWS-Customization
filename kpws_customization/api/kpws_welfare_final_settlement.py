@@ -1,0 +1,766 @@
+import frappe
+from frappe.utils import flt, nowdate, cint
+
+COMPANY = "Kiran Patient Welfare Society"
+WELFARE_RECEIVABLE = "WELFARE RECEIVABLE - KPWS"
+CASH_PHARMACY_ACCOUNT = "CASH (PHARMACY) - KPWS"
+
+
+def _settings():
+    return frappe.get_single("KPWS Pharmacy Billing Settings")
+
+
+def _get_total(si):
+    return flt(si.get("rounded_total") or si.get("grand_total"), 2)
+
+
+def _get_cash_mode_of_payment():
+    """
+    Find or create a Mode of Payment that points to CASH (PHARMACY) - KPWS.
+    This is used only for patient's remaining cash share.
+    """
+    rows = frappe.db.sql("""
+        SELECT parent
+        FROM `tabMode of Payment Account`
+        WHERE company=%s AND default_account=%s
+        LIMIT 1
+    """, (COMPANY, CASH_PHARMACY_ACCOUNT), as_dict=True)
+
+    if rows:
+        return rows[0].parent
+
+    mop_name = "Cash Pharmacy"
+
+    if not frappe.db.exists("Mode of Payment", mop_name):
+        mop = frappe.new_doc("Mode of Payment")
+        mop.mode_of_payment = mop_name
+        mop.type = "Cash"
+        mop.append("accounts", {
+            "company": COMPANY,
+            "default_account": CASH_PHARMACY_ACCOUNT
+        })
+        mop.insert(ignore_permissions=True)
+    else:
+        mop = frappe.get_doc("Mode of Payment", mop_name)
+        found = False
+        for row in mop.get("accounts") or []:
+            if row.company == COMPANY:
+                row.default_account = CASH_PHARMACY_ACCOUNT
+                found = True
+        if not found:
+            mop.append("accounts", {
+                "company": COMPANY,
+                "default_account": CASH_PHARMACY_ACCOUNT
+            })
+        mop.save(ignore_permissions=True)
+
+    frappe.db.commit()
+    return mop_name
+
+
+def _get_patient_from_invoice(si):
+    return (
+        si.get("patient")
+        or si.get("custom_patient")
+        or si.get("custom_kpws_patient")
+        or si.get("custom_patient_id")
+    )
+
+
+def _latest_welfare_registration(si):
+    """
+    Flexible lookup because your Patient Registration Form fields changed during customizations.
+    """
+    patient = _get_patient_from_invoice(si)
+
+    if not patient:
+        return {}
+
+    possible_doctypes = [
+        "Patient Registration Form",
+        "KPWS Patient Registration Form",
+    ]
+
+    for dt in possible_doctypes:
+        if not frappe.db.exists("DocType", dt):
+            continue
+
+        meta = frappe.get_meta(dt)
+
+        patient_field = None
+        for fieldname in [
+            "patient",
+            "custom_patient",
+            "custom_kpws_patient",
+            "patient_id",
+            "custom_patient_id",
+        ]:
+            if meta.has_field(fieldname):
+                patient_field = fieldname
+                break
+
+        if not patient_field:
+            continue
+
+        regs = frappe.get_all(
+            dt,
+            filters={
+                patient_field: patient,
+                "docstatus": 1,
+            },
+            fields=["name"],
+            order_by="modified desc",
+            limit=1,
+        )
+
+        if not regs:
+            continue
+
+        reg = frappe.get_doc(dt, regs[0].name)
+
+        purpose = ""
+        for fieldname in [
+            "purpose",
+            "custom_kpws_welfare_type",
+            "custom_welfare_type",
+            "assistance_source",
+            "custom_assistance_source",
+        ]:
+            if meta.has_field(fieldname) and reg.get(fieldname):
+                purpose = reg.get(fieldname)
+                break
+
+        percentage = 0
+        for fieldname in [
+            "custom_kpws_welfare_percentage",
+            "custom_welfare_percentage",
+            "discount_value",
+            "custom_discount_value",
+            "percentage",
+            "assistance_percentage",
+            "custom_assistance_percentage",
+        ]:
+            if meta.has_field(fieldname) and reg.get(fieldname):
+                percentage = flt(reg.get(fieldname), 2)
+                break
+
+        return {
+            "doctype": dt,
+            "name": reg.name,
+            "purpose": purpose or "Zakat",
+            "percentage": percentage,
+        }
+
+    return {}
+
+
+def _is_welfare_invoice(si):
+    settings = _settings()
+    welfare_receivable = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+
+    if si.get("custom_kpws_welfare_covered_amount"):
+        return True
+
+    if si.get("custom_kpws_patient_share_amount"):
+        return True
+
+    if si.get("custom_kpws_patient_billing_group") == "Welfare":
+        return True
+
+    if si.debit_to == welfare_receivable:
+        return True
+
+    if _latest_welfare_registration(si):
+        return True
+
+    return False
+
+
+def _calculate_split(si, covered_amount=None, patient_cash=None, patient_card=None):
+    total = _get_total(si)
+    reg = _latest_welfare_registration(si)
+
+    purpose = (
+        si.get("custom_kpws_purpose")
+        or si.get("custom_kpws_assistance_source")
+        or si.get("custom_kpws_welfare_source")
+        or reg.get("purpose")
+        or "Zakat"
+    )
+
+    percentage = flt(
+        si.get("custom_kpws_approved_percentage")
+        or reg.get("percentage")
+        or 0,
+        2
+    )
+
+    covered = flt(
+        covered_amount
+        if covered_amount is not None
+        else si.get("custom_kpws_welfare_covered_amount"),
+        2
+    )
+
+    if covered <= 0 and percentage > 0:
+        covered = flt(total * percentage / 100, 2)
+
+    if covered > total:
+        covered = total
+
+    patient_share = flt(total - covered, 2)
+
+    cash = flt(
+        patient_cash
+        if patient_cash is not None
+        else si.get("custom_kpws_patient_cash_amount"),
+        2
+    )
+
+    card = flt(
+        patient_card
+        if patient_card is not None
+        else si.get("custom_kpws_patient_card_amount"),
+        2
+    )
+
+    # Important KPWS rule:
+    # If the patient share remains and no card/cash split is provided,
+    # wipe the remaining amount through CASH (PHARMACY) automatically.
+    if patient_share > 0 and flt(cash + card, 2) <= 0:
+        cash = patient_share
+
+    # If there is a small difference, adjust cash.
+    if patient_share > 0 and flt(cash + card, 2) != patient_share:
+        cash = flt(cash + (patient_share - cash - card), 2)
+
+    return {
+        "total": total,
+        "covered": covered,
+        "patient_share": patient_share,
+        "cash": cash,
+        "card": card,
+        "purpose": purpose,
+        "percentage": percentage,
+        "registration": reg.get("name"),
+    }
+
+
+def _set_invoice_base_fields(si, split):
+    settings = _settings()
+    welfare_receivable = settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+
+    # Direct DB update because many invoices are already submitted.
+    updates = {
+        "is_pos": 0,
+        "pos_profile": "",
+        "debit_to": welfare_receivable,
+    }
+
+    if si.meta.has_field("custom_kpws_welfare_covered_amount"):
+        updates["custom_kpws_welfare_covered_amount"] = split["covered"]
+
+    if si.meta.has_field("custom_kpws_patient_share_amount"):
+        updates["custom_kpws_patient_share_amount"] = split["patient_share"]
+
+    if si.meta.has_field("custom_kpws_patient_cash_amount"):
+        updates["custom_kpws_patient_cash_amount"] = split["cash"]
+
+    if si.meta.has_field("custom_kpws_patient_card_amount"):
+        updates["custom_kpws_patient_card_amount"] = split["card"]
+
+    if si.meta.has_field("custom_kpws_purpose"):
+        updates["custom_kpws_purpose"] = split["purpose"]
+
+    if si.meta.has_field("custom_kpws_approved_percentage"):
+        updates["custom_kpws_approved_percentage"] = split["percentage"]
+
+    for field, value in updates.items():
+        frappe.db.set_value("Sales Invoice", si.name, field, value, update_modified=False)
+
+    # Welfare must not have POS payment child rows.
+    frappe.db.sql("""
+        DELETE FROM `tabSales Invoice Payment`
+        WHERE parent=%s AND parenttype='Sales Invoice'
+    """, si.name)
+
+    frappe.db.commit()
+
+
+def _existing_pe(si_name, mode_of_payment):
+    rows = frappe.db.sql("""
+        SELECT pe.name
+        FROM `tabPayment Entry Reference` ref
+        INNER JOIN `tabPayment Entry` pe ON pe.name = ref.parent
+        WHERE ref.reference_doctype='Sales Invoice'
+          AND ref.reference_name=%s
+          AND pe.mode_of_payment=%s
+          AND pe.docstatus=1
+        LIMIT 1
+    """, (si_name, mode_of_payment), as_dict=True)
+
+    return rows[0].name if rows else None
+
+
+def _existing_je(si_name):
+    rows = frappe.db.sql("""
+        SELECT je.name
+        FROM `tabJournal Entry Account` acc
+        INNER JOIN `tabJournal Entry` je ON je.name = acc.parent
+        WHERE acc.reference_type='Sales Invoice'
+          AND acc.reference_name=%s
+          AND acc.credit_in_account_currency > 0
+          AND je.docstatus=1
+        LIMIT 1
+    """, si_name, as_dict=True)
+
+    return rows[0].name if rows else None
+
+
+def _create_cash_payment_entry(si, amount):
+    amount = flt(amount, 2)
+
+    if amount <= 0:
+        return None
+
+    mode_of_payment = _get_cash_mode_of_payment()
+
+    existing = _existing_pe(si.name, mode_of_payment)
+    if existing:
+        if si.meta.has_field("custom_kpws_cash_payment_entry"):
+            frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_cash_payment_entry", existing, update_modified=False)
+        return existing
+
+    receivable = si.debit_to or WELFARE_RECEIVABLE
+
+    pe = frappe.new_doc("Payment Entry")
+    pe.payment_type = "Receive"
+    pe.company = si.company
+    pe.posting_date = si.posting_date or nowdate()
+    pe.mode_of_payment = mode_of_payment
+    pe.party_type = "Customer"
+    pe.party = si.customer
+    pe.paid_from = receivable
+    pe.paid_to = CASH_PHARMACY_ACCOUNT
+    pe.paid_amount = amount
+    pe.received_amount = amount
+    pe.reference_no = si.name
+    pe.reference_date = si.posting_date or nowdate()
+
+    pe.append("references", {
+        "reference_doctype": "Sales Invoice",
+        "reference_name": si.name,
+        "allocated_amount": amount,
+    })
+
+    pe.insert(ignore_permissions=True)
+    pe.submit()
+
+    if si.meta.has_field("custom_kpws_cash_payment_entry"):
+        frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_cash_payment_entry", pe.name, update_modified=False)
+
+    return pe.name
+
+
+def _create_welfare_journal(si, split):
+    amount = flt(split["covered"], 2)
+
+    if amount <= 0:
+        return None
+
+    existing = _existing_je(si.name)
+    if existing:
+        if si.meta.has_field("custom_kpws_auto_journal_entry"):
+            frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_auto_journal_entry", existing, update_modified=False)
+        return existing
+
+    settings = _settings()
+
+    purpose = (split.get("purpose") or "Zakat").lower()
+
+    if "donation" in purpose:
+        expense_account = settings.get("donation_disbursement_account")
+        label = "Donation"
+    else:
+        expense_account = settings.get("zakat_disbursement_account")
+        label = "Zakat"
+
+    if not expense_account:
+        frappe.throw(f"{label} Disbursement Account missing in KPWS Pharmacy Billing Settings")
+
+    receivable = si.debit_to or settings.get("welfare_receivable_account") or WELFARE_RECEIVABLE
+
+    je = frappe.new_doc("Journal Entry")
+    je.voucher_type = "Journal Entry"
+    je.company = si.company
+    je.posting_date = si.posting_date or nowdate()
+    je.user_remark = f"Auto {label} welfare settlement against Sales Invoice {si.name}"
+
+    je.append("accounts", {
+        "account": expense_account,
+        "debit_in_account_currency": amount,
+        "credit_in_account_currency": 0,
+    })
+
+    je.append("accounts", {
+        "account": receivable,
+        "party_type": "Customer",
+        "party": si.customer,
+        "reference_type": "Sales Invoice",
+        "reference_name": si.name,
+        "debit_in_account_currency": 0,
+        "credit_in_account_currency": amount,
+    })
+
+    je.insert(ignore_permissions=True)
+    je.submit()
+
+    if si.meta.has_field("custom_kpws_auto_journal_entry"):
+        frappe.db.set_value("Sales Invoice", si.name, "custom_kpws_auto_journal_entry", je.name, update_modified=False)
+
+    return je.name
+
+
+def _refresh_invoice(si_name):
+    si = frappe.get_doc("Sales Invoice", si_name)
+
+    try:
+        si.set_status(update=True)
+    except Exception:
+        pass
+
+    frappe.db.commit()
+
+    return {
+        "invoice": si.name,
+        "status": frappe.db.get_value("Sales Invoice", si.name, "status"),
+        "outstanding": frappe.db.get_value("Sales Invoice", si.name, "outstanding_amount"),
+        "is_pos": frappe.db.get_value("Sales Invoice", si.name, "is_pos"),
+        "cash_pe": frappe.db.get_value("Sales Invoice", si.name, "custom_kpws_cash_payment_entry"),
+        "auto_je": frappe.db.get_value("Sales Invoice", si.name, "custom_kpws_auto_journal_entry"),
+    }
+
+
+def settle_welfare_invoice(si_name, covered_amount=None, patient_cash=None, patient_card=None):
+    """
+    Can be called manually or automatically.
+    Remaining patient share is always cleared through CASH (PHARMACY) unless explicit card amount is passed.
+    """
+    si = frappe.get_doc("Sales Invoice", si_name)
+
+    split = _calculate_split(
+        si,
+        covered_amount=covered_amount,
+        patient_cash=patient_cash,
+        patient_card=patient_card,
+    )
+
+    _set_invoice_base_fields(si, split)
+
+    si.reload()
+
+    # First clear patient share through Cash Pharmacy
+    if split["cash"] > 0:
+        _create_cash_payment_entry(si, split["cash"])
+
+    # Then clear welfare covered amount through JE
+    if split["covered"] > 0:
+        _create_welfare_journal(si, split)
+
+    return _refresh_invoice(si.name)
+
+
+def before_sales_invoice_submit(doc, method=None):
+    """
+    Before submit, Welfare invoice must be non-POS.
+    """
+    if not _is_welfare_invoice(doc):
+        return
+
+    split = _calculate_split(doc)
+
+    doc.is_pos = 0
+    doc.pos_profile = None
+    doc.debit_to = _settings().get("welfare_receivable_account") or WELFARE_RECEIVABLE
+    doc.set("payments", [])
+
+    if doc.meta.has_field("custom_kpws_welfare_covered_amount"):
+        doc.custom_kpws_welfare_covered_amount = split["covered"]
+
+    if doc.meta.has_field("custom_kpws_patient_share_amount"):
+        doc.custom_kpws_patient_share_amount = split["patient_share"]
+
+    if doc.meta.has_field("custom_kpws_patient_cash_amount"):
+        doc.custom_kpws_patient_cash_amount = split["cash"]
+
+    if doc.meta.has_field("custom_kpws_patient_card_amount"):
+        doc.custom_kpws_patient_card_amount = split["card"]
+
+    if doc.meta.has_field("custom_kpws_purpose"):
+        doc.custom_kpws_purpose = split["purpose"]
+
+
+def on_sales_invoice_submit(doc, method=None):
+    """
+    Auto-settle after submit:
+    - Patient share -> Cash Pharmacy Payment Entry
+    - Welfare share -> Zakat/Donation Journal Entry
+    """
+    if getattr(frappe.flags, "kpws_final_welfare_settlement_running", False):
+        return
+
+    if not _is_welfare_invoice(doc):
+        return
+
+    try:
+        frappe.flags.kpws_final_welfare_settlement_running = True
+        settle_welfare_invoice(doc.name)
+    finally:
+        frappe.flags.kpws_final_welfare_settlement_running = False
+
+
+def repair(si_name, covered_amount=None, patient_cash=None, patient_card=None):
+    return settle_welfare_invoice(si_name, covered_amount, patient_cash, patient_card)
+
+
+# KPWS_SUBMITTED_WELFARE_INVOICE_PROTECTION_V35
+def protect_submitted_invoice_before_save(doc, method=None):
+    """
+    Prevent browser/client scripts from changing submitted KPWS Welfare invoices.
+
+    Fixes errors like:
+      - Not allowed to change Customer after submission
+      - Not allowed to change Include Payment (POS) after submission
+      - Not allowed to change Price List after submission
+
+    This restores immutable submitted fields from database before ERPNext
+    validate_update_after_submit runs.
+    """
+    import frappe
+
+    if doc.doctype != "Sales Invoice":
+        return
+
+    if doc.docstatus != 1 or not doc.name:
+        return
+
+    db = frappe.db.get_value(
+        "Sales Invoice",
+        doc.name,
+        [
+            "customer",
+            "customer_name",
+            "debit_to",
+            "is_pos",
+            "pos_profile",
+            "selling_price_list",
+            "price_list_currency",
+            "plc_conversion_rate",
+            "conversion_rate",
+            "currency",
+            "company",
+            "posting_date",
+            "set_posting_time",
+            "due_date",
+            "update_stock",
+            "set_warehouse",
+            "status",
+            "outstanding_amount",
+        ],
+        as_dict=True,
+    )
+
+    if not db:
+        return
+
+    settings = frappe.get_single("KPWS Pharmacy Billing Settings")
+    welfare_receivable = settings.get("welfare_receivable_account") or "WELFARE RECEIVABLE - KPWS"
+
+    is_kpws_welfare = bool(
+        doc.get("custom_kpws_auto_journal_entry")
+        or doc.get("custom_kpws_cash_payment_entry")
+        or doc.get("custom_kpws_welfare_covered_amount")
+        or doc.get("custom_kpws_patient_share_amount")
+        or db.debit_to == welfare_receivable
+        or doc.debit_to == welfare_receivable
+    )
+
+    if not is_kpws_welfare:
+        return
+
+    # Restore immutable fields exactly as they are saved in DB
+    protected_fields = [
+        "customer",
+        "customer_name",
+        "debit_to",
+        "is_pos",
+        "pos_profile",
+        "selling_price_list",
+        "price_list_currency",
+        "plc_conversion_rate",
+        "conversion_rate",
+        "currency",
+        "company",
+        "posting_date",
+        "set_posting_time",
+        "due_date",
+        "update_stock",
+        "set_warehouse",
+        "status",
+        "outstanding_amount",
+    ]
+
+    for fieldname in protected_fields:
+        if hasattr(doc, fieldname):
+            doc.set(fieldname, db.get(fieldname))
+
+    # Welfare invoices must not carry POS payment rows
+    doc.set("payments", [])
+
+    # Keep paid/change fields neutral
+    for fieldname in (
+        "paid_amount",
+        "base_paid_amount",
+        "change_amount",
+        "base_change_amount",
+        "write_off_amount",
+        "base_write_off_amount",
+    ):
+        if hasattr(doc, fieldname):
+            doc.set(fieldname, 0)
+
+
+# KPWS_FINAL_SUBMITTED_SALES_INVOICE_LOCK_V36
+def protect_submitted_sales_invoice_before_save(doc, method=None):
+    """
+    Permanent protection for submitted KPWS Sales Invoices.
+
+    Problem fixed:
+    Some client/custom script changes submitted Sales Invoice fields like:
+      - Customer
+      - Price List
+      - Include Payment (POS)
+      - POS Profile
+      - Debit To
+      - Item rates / child rows
+
+    ERPNext then throws:
+      Not allowed to change Price List after submission
+      Not allowed to change Customer after submission
+      Not allowed to change Include Payment (POS) after submission
+
+    This restores protected fields from the database before validation/update.
+    """
+    import frappe
+
+    if doc.doctype != "Sales Invoice":
+        return
+
+    if doc.docstatus != 1 or not doc.name:
+        return
+
+    db_doc = frappe.get_doc("Sales Invoice", doc.name)
+
+    settings = frappe.get_single("KPWS Pharmacy Billing Settings")
+    welfare_receivable = settings.get("welfare_receivable_account") or "WELFARE RECEIVABLE - KPWS"
+
+    is_kpws_invoice = bool(
+        doc.name.startswith("SINV-KPWS")
+        or db_doc.name.startswith("SINV-KPWS")
+        or db_doc.debit_to == welfare_receivable
+        or doc.debit_to == welfare_receivable
+        or db_doc.get("custom_kpws_auto_journal_entry")
+        or db_doc.get("custom_kpws_cash_payment_entry")
+        or db_doc.get("custom_kpws_welfare_covered_amount")
+        or db_doc.get("custom_kpws_patient_share_amount")
+        or doc.get("custom_kpws_welfare_covered_amount")
+        or doc.get("custom_kpws_patient_share_amount")
+    )
+
+    if not is_kpws_invoice:
+        return
+
+    protected_fields = [
+        "customer",
+        "customer_name",
+        "debit_to",
+        "is_pos",
+        "pos_profile",
+        "selling_price_list",
+        "price_list_currency",
+        "plc_conversion_rate",
+        "conversion_rate",
+        "currency",
+        "company",
+        "posting_date",
+        "set_posting_time",
+        "due_date",
+        "update_stock",
+        "set_warehouse",
+        "status",
+        "outstanding_amount",
+        "grand_total",
+        "rounded_total",
+        "base_grand_total",
+        "base_rounded_total",
+        "total",
+        "base_total",
+        "net_total",
+        "base_net_total",
+        "disable_rounded_total",
+    ]
+
+    for fieldname in protected_fields:
+        if doc.meta.has_field(fieldname):
+            doc.set(fieldname, db_doc.get(fieldname))
+
+    # Restore important KPWS custom fields from DB
+    for fieldname in [
+        "custom_kpws_welfare_covered_amount",
+        "custom_kpws_patient_share_amount",
+        "custom_kpws_patient_cash_amount",
+        "custom_kpws_patient_card_amount",
+        "custom_kpws_cash_payment_entry",
+        "custom_kpws_card_payment_entry",
+        "custom_kpws_auto_journal_entry",
+        "custom_kpws_purpose",
+        "custom_kpws_approved_percentage",
+    ]:
+        if doc.meta.has_field(fieldname):
+            doc.set(fieldname, db_doc.get(fieldname))
+
+    # Restore child tables that scripts often alter when Price List changes.
+    child_tables = [
+        "items",
+        "taxes",
+        "payments",
+        "advances",
+        "payment_schedule",
+        "sales_team",
+        "packed_items",
+        "pricing_rules",
+    ]
+
+    for tablefield in child_tables:
+        if not doc.meta.has_field(tablefield):
+            continue
+
+        doc.set(tablefield, [])
+
+        for old_row in db_doc.get(tablefield) or []:
+            new_row = doc.append(tablefield, {})
+            old_data = old_row.as_dict()
+
+            for key, value in old_data.items():
+                if key in ("doctype", "parent", "parenttype", "parentfield"):
+                    continue
+                new_row.set(key, value)
+
+            new_row.name = old_row.name
+            new_row.idx = old_row.idx
+
+    # KPWS Welfare invoices must never become POS after submission.
+    if db_doc.debit_to == welfare_receivable or db_doc.get("custom_kpws_welfare_covered_amount"):
+        doc.is_pos = 0
+        doc.pos_profile = None
+        doc.set("payments", [])

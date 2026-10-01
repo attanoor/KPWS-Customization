@@ -1,0 +1,169 @@
+/* KPWS Step 1 - Patient Registration / Billing Type Flow */
+(function () {
+    const BILLING_FIELD = "custom_patient_billing_type";
+    const OLD_GROUP_FIELD = "customer_group";
+    const PANEL_FIELD = "panel_name";
+    const PANEL_CUSTOMER_FIELD = "custom_panel_customer";
+    const WELFARE_REG_FIELD = "custom_latest_welfare_registration";
+
+    function has_field(frm, fieldname) {
+        return frm.fields_dict && frm.fields_dict[fieldname];
+    }
+
+    function set_panel_query(frm) {
+        [PANEL_FIELD, PANEL_CUSTOMER_FIELD].forEach(function (fieldname) {
+            if (!has_field(frm, fieldname)) return;
+
+            frm.set_query(fieldname, function () {
+                return {
+                    query: "kpws_customization.api.kpws_step1_patient_welfare.get_panel_customers"
+                };
+            });
+        });
+    }
+
+    function sync_old_group(frm) {
+        if (!has_field(frm, OLD_GROUP_FIELD)) return;
+
+        const billing_type = frm.doc[BILLING_FIELD] || frm.doc[OLD_GROUP_FIELD] || "Cash";
+
+        frm.set_value(OLD_GROUP_FIELD, billing_type);
+    }
+
+    function apply_visibility(frm) {
+        const billing_type = frm.doc[BILLING_FIELD] || frm.doc[OLD_GROUP_FIELD] || "Cash";
+
+        if (has_field(frm, OLD_GROUP_FIELD)) {
+            frm.set_df_property(OLD_GROUP_FIELD, "hidden", 1);
+            frm.set_df_property(OLD_GROUP_FIELD, "reqd", 0);
+            frm.set_df_property(OLD_GROUP_FIELD, "read_only", 1);
+        }
+
+        if (has_field(frm, BILLING_FIELD)) {
+            frm.set_df_property(BILLING_FIELD, "hidden", 0);
+            frm.set_df_property(BILLING_FIELD, "reqd", 1);
+            frm.set_df_property(BILLING_FIELD, "options", "\nCash\nWelfare\nPanel");
+        }
+
+        [PANEL_FIELD, PANEL_CUSTOMER_FIELD].forEach(function (fieldname) {
+            if (!has_field(frm, fieldname)) return;
+
+            frm.set_df_property(fieldname, "hidden", billing_type !== "Panel");
+            frm.set_df_property(fieldname, "reqd", billing_type === "Panel");
+        });
+
+        if (has_field(frm, WELFARE_REG_FIELD)) {
+            frm.set_df_property(WELFARE_REG_FIELD, "read_only", 1);
+            frm.set_df_property(WELFARE_REG_FIELD, "hidden", billing_type !== "Welfare");
+        }
+
+        ["custom_welfare_type", "custom_welfare_percentage"].forEach(function (fieldname) {
+            if (!has_field(frm, fieldname)) return;
+            frm.set_df_property(fieldname, "read_only", 1);
+            frm.set_df_property(fieldname, "hidden", billing_type !== "Welfare");
+        });
+    }
+
+    function create_welfare_registration(frm) {
+        if (frm.is_new()) {
+            frappe.msgprint(__("Please save the Patient first, then create Welfare Registration."));
+            return;
+        }
+
+        frappe.call({
+            method: "kpws_customization.api.kpws_step1_patient_welfare.create_or_open_welfare_registration",
+            args: {
+                patient: frm.doc.name
+            },
+            freeze: true,
+            freeze_message: __("Creating Welfare Registration..."),
+            callback: function (r) {
+                if (!r.message || !r.message.name) return;
+
+                frappe.show_alert({
+                    message: r.message.created ? __("Welfare Registration created.") : __("Existing Welfare Registration opened."),
+                    indicator: r.message.created ? "green" : "blue"
+                });
+
+                frappe.set_route("Form", "Patient Registration Form", r.message.name);
+            }
+        });
+    }
+
+    function add_buttons(frm) {
+        if (frm.is_new()) return;
+
+        const billing_type = frm.doc[BILLING_FIELD] || frm.doc[OLD_GROUP_FIELD];
+
+        if (billing_type === "Welfare") {
+            frm.add_custom_button(__("Create Welfare Registration"), function () {
+                create_welfare_registration(frm);
+            }, __("KPWS"));
+        }
+
+        if (frm.doc[WELFARE_REG_FIELD]) {
+            frm.add_custom_button(__("Open Welfare Registration"), function () {
+                frappe.set_route("Form", "Patient Registration Form", frm.doc[WELFARE_REG_FIELD]);
+            }, __("KPWS"));
+        }
+    }
+
+    function maybe_prompt_welfare(frm) {
+        if (frm.doc[BILLING_FIELD] !== "Welfare") return;
+        if (frm.doc[WELFARE_REG_FIELD]) return;
+
+        frappe.confirm(
+            __("This patient is marked as Welfare. Create Welfare Registration now?"),
+            function () {
+                create_welfare_registration(frm);
+            }
+        );
+    }
+
+    frappe.ui.form.on("Patient", {
+        setup: function (frm) {
+            set_panel_query(frm);
+        },
+
+        onload: function (frm) {
+            set_panel_query(frm);
+            apply_visibility(frm);
+        },
+
+        refresh: function (frm) {
+            set_panel_query(frm);
+            apply_visibility(frm);
+            add_buttons(frm);
+        },
+
+        after_save: function (frm) {
+            maybe_prompt_welfare(frm);
+        },
+
+        custom_patient_billing_type: function (frm) {
+            sync_old_group(frm);
+            apply_visibility(frm);
+
+            if (frm.doc[BILLING_FIELD] === "Cash") {
+                if (has_field(frm, PANEL_FIELD)) frm.set_value(PANEL_FIELD, "");
+                if (has_field(frm, PANEL_CUSTOMER_FIELD)) frm.set_value(PANEL_CUSTOMER_FIELD, "");
+            }
+        },
+
+        panel_name: function (frm) {
+            if (has_field(frm, PANEL_CUSTOMER_FIELD)) {
+                frm.set_value(PANEL_CUSTOMER_FIELD, frm.doc[PANEL_FIELD] || "");
+            }
+        },
+
+        custom_panel_customer: function (frm) {
+            if (has_field(frm, PANEL_FIELD) && frm.doc[PANEL_CUSTOMER_FIELD]) {
+                frm.set_value(PANEL_FIELD, frm.doc[PANEL_CUSTOMER_FIELD]);
+            }
+        },
+
+        before_save: function (frm) {
+            sync_old_group(frm);
+        }
+    });
+})();

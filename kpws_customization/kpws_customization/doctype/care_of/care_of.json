@@ -1,0 +1,35 @@
+{
+ "actions": [],
+ "allow_rename": 1,
+ "autoname": "hash",
+ "creation": "2025-11-12 12:37:53.001671",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "care_person_name"
+ ],
+ "fields": [
+  {
+   "fieldname": "care_person_name",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "label": "Care Of (Name)",
+   "options": "Patient",
+   "reqd": 1
+  }
+ ],
+ "index_web_pages_for_search": 1,
+ "istable": 1,
+ "links": [],
+ "modified": "2025-11-12 13:34:14.479626",
+ "modified_by": "Administrator",
+ "module": "Kpws Customization",
+ "name": "Care Of",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [],
+ "sort_field": "modified",
+ "sort_order": "DESC",
+ "states": []
+}
